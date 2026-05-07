@@ -5,9 +5,6 @@ library(DT)
 library(ggplot2)
 library(reticulate)
 
-# ============================================================
-# PASUL 1: Import Resurse (Standarde R și Logică Python)
-# ============================================================
 source("R/standards.R")
 source_python("logic.py")
 
@@ -53,7 +50,15 @@ server <- function(input, output, session) {
   
   data_info <- reactive({
     req(input$file)
-    profile_data(input$file$datapath)
+    info <- profile_data(input$file$datapath)
+    
+    # Validare structurala (FR-01)
+    if (!is.null(info$error)) {
+      showNotification(info$error, type = "error", duration = 10)
+      validate(need(is.null(info$error), info$error))
+    }
+    
+    return(info)
   })
   
   data_final <- reactive({
@@ -108,7 +113,6 @@ server <- function(input, output, session) {
   
   output$metrics <- renderPrint({
     req(input$run)
-    # Validare: asigurăm că inputurile sunt selectate corect înainte de calcul
     validate(
       need(input$sensitive!= "", "Vă rugăm să selectați un atribut sensibil."),
       need(input$target!= "", "Vă rugăm să selectați o variabilă target.")
@@ -119,9 +123,11 @@ server <- function(input, output, session) {
     target_type <- info$types[[input$target]]
     
     cat("Analiză efectuată pe:", input$target, "raportat la", input$sensitive, "\n")
+    cat("Tip țintă detectat:", target_type, "\n")
     cat("------------------------------------------------------------\n\n")
     
     if (target_type == "Numerică") {
+      # --- LOGICĂ PENTRU VALORI NUMERICE (COHEN'S D) ---
       res_stats <- df %>%
         group_by(.data[[input$sensitive]]) %>%
         summarise(Media = mean(.data[[input$target]], na.rm = TRUE),
@@ -129,35 +135,72 @@ server <- function(input, output, session) {
                   N = n())
       print(res_stats)
       
-      if (nrow(res_stats) == 2) {
-        # Verificăm dacă ambele grupuri au mai mult de 1 element pentru SD valid
-        if (all(res_stats$N > 1)) {
-          m1 <- res_stats$Media[1]; m2 <- res_stats$Media[2]
-          s1 <- res_stats$SD[1]; s2 <- res_stats$SD[2]
-          n1 <- res_stats$N[1]; n2 <- res_stats$N[2]
-          
-          s_pooled <- sqrt(((n1 - 1) * s1^2 + (n2 - 1) * s2^2) / (n1 + n2 - 2))
-          cohen_d <- abs(m1 - m2) / s_pooled
-          
-          cat("\n>>> Mărimea efectului (Cohen's d):", round(cohen_d, 4), "\n")
-          
-          # Fix pentru eroarea de TRUE/FALSE: verificăm dacă cohen_d nu este NA
-          if (!is.na(cohen_d)) {
-            interpretare <- if(cohen_d < 0.2) "Neglijabil" else if(cohen_d < 0.5) "Mic" else "Ridicat"
-            cat("Interpretare:", interpretare, "\n")
-          }
-        } else {
-          cat("\n[Atenție] Unul dintre grupuri are un singur eșantion. Cohen's d nu poate fi calculat.\n")
+      if (nrow(res_stats) == 2 && all(res_stats$N > 1)) {
+        m1 <- res_stats$Media[1]; m2 <- res_stats$Media[2]
+        s1 <- res_stats$SD[1]; s2 <- res_stats$SD[2]
+        n1 <- res_stats$N[1]; n2 <- res_stats$N[2]
+        s_pooled <- sqrt(((n1 - 1) * s1^2 + (n2 - 1) * s2^2) / (n1 + n2 - 2))
+        cohen_d <- abs(m1 - m2) / s_pooled
+        cat("\n>>> Mărimea efectului (Cohen's d):", round(cohen_d, 4), "\n")
+        interpretare <- if(cohen_d < 0.2) "Neglijabil" else if(cohen_d < 0.5) "Mic" else "Ridicat"
+        cat("Interpretare:", interpretare, "\n")
+      } else if (nrow(res_stats) > 2) {
+        cat("\n[Notă] Cohen's d se calculează standard între 2 grupuri. Pentru mai multe grupuri (ex: Vârstă), analizați diferențele mediilor în tabelul de mai sus.")
+      }
+      
+    } else {
+      # --- LOGICĂ PENTRU BINARĂ / CATEGORICĂ (SPD & PARITY) ---
+      # Identificăm valoarea de succes (ex: "Angajat", "Da", sau 1)
+      vals <- sort(unique(df[[input$target]]))
+      success_label <- vals[length(vals)] # Luăm ultima valoare alfabetic drept succes
+      
+      res_parity <- df %>%
+        group_by(.data[[input$sensitive]]) %>%
+        summarise(
+          Total = n(),
+          Succese = sum(.data[[input$target]] == success_label, na.rm = TRUE),
+          Rata_Succes = round(Succese / Total, 4)
+        )
+      
+      cat("Frecvențe și Proporții (Cazul de succes: '", as.character(success_label), "')\n", sep="")
+      print(res_parity)
+      
+      if (nrow(res_parity) == 2) {
+        p1 <- res_parity$Rata_Succes[1]
+        p2 <- res_parity$Rata_Succes[2]
+        
+        spd <- p1 - p2
+        di <- if(p2!= 0) p1 / p2 else NA
+        
+        cat("\n>>> Statistical Parity Difference (SPD):", round(spd, 4), "\n")
+        cat(">>> Disparate Impact (DI):", round(di, 4), "\n")
+        
+        if (!is.na(di)) {
+          # Regula de 80% (standard internațional conform Das et al. 2021)
+          interpretare <- if(di >= 0.8 && di <= 1.25) "Echitabil (Bias Neglijabil)" else "Risc ridicat de discriminare"
+          cat("Interpretare (Regula 80%):", interpretare, "\n")
         }
+      } else {
+        cat("\n[Notă] Analiza automată SPD/DI este optimă pentru 2 grupuri (ex: Gen).")
+        cat("\nPentru atribute multiple (ex: Vârstă), comparați ratele de succes din tabelul de mai sus.")
       }
     }
-    # (Logica pentru Binară rămâne neschimbată)
   })
   
   output$plot <- renderPlot({
     req(data_final(), input$sensitive, input$target)
-    ggplot(data_final(), aes_string(x = input$sensitive, y = input$target, fill = input$sensitive)) +
-      geom_boxplot() + theme_minimal()
+    df_plot <- data_final()
+    info <- data_info()
+    
+    if(info$types[[input$target]] == "Numerică") {
+      ggplot(df_plot, aes(x =.data[[input$sensitive]], y =.data[[input$target]], fill =.data[[input$sensitive]])) +
+        geom_boxplot() + theme_minimal() + labs(title = "Distribuția Valorilor Numerice")
+    } else {
+      # Pentru variabile binare, folosim un bar chart cu proporții (sugestiv pentru Parity)
+      ggplot(df_plot, aes(x =.data[[input$sensitive]], fill = as.factor(.data[[input$target]]))) +
+        geom_bar(position = "fill") + theme_minimal() +
+        labs(y = "Proporție", fill = input$target, title = "Proporția Rezultatelor pe Grupuri")
+    }
   })
 }
 

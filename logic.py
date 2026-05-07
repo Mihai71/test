@@ -5,6 +5,14 @@ import re
 def profile_data(file_path):
     df = pd.read_csv(file_path)
     
+    # Verificare minim 2 coloane (Atribut Sensibil + Target)
+    if df.shape[1] < 2:
+        return {"error": "Fișierul trebuie să conțină cel puțin 2 coloane."}
+    
+    # Verificare dacă există rânduri de date după header
+    if df.empty:
+        return {"error": "Fișierul este gol sau conține doar header-ul."}
+    
     # 1. Detecție valori lipsă detaliată (FR-05)
     missing_info = df.isnull().sum().to_dict()
     
