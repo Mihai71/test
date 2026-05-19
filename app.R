@@ -73,15 +73,17 @@ ui <- dashboardPage(
                    "Setare manuală tip coloană"),
       selectInput("override_col",  "Coloana", choices = NULL),
       selectInput("override_type", "Tip nou",
-                  choices = c("Numerică" = "Numerica",
-                              "Binară"   = "Binara",
+                  choices = c("Numerică"   = "Numerica",
+                              "Binară"     = "Binara",
                               "Categorică" = "Categorica")),
       actionButton("apply_override", "Aplică", class = "btn-xs btn-warning", icon = icon("edit"))
     ),
     tags$hr(),
-    actionButton("run", "Rulează analiza", icon = icon("play"),
-                 class = "btn-primary btn-block"),
-    tags$br()
+    div(style = "padding: 0 15px 10px 15px;",
+        actionButton("run", "Rulează analiza", icon = icon("play"),
+                     class = "btn-primary btn-block",
+                     style = "width: 100%;")
+    )
   ),
   
   dashboardBody(
@@ -89,11 +91,13 @@ ui <- dashboardPage(
       tags$style(HTML("
         .bias-gauge { font-size: 2.5em; font-weight: bold; text-align: center; padding: 10px; border-radius: 8px; }
         .alert-box  { border-left: 5px solid; padding: 10px; margin: 6px 0; border-radius: 4px; }
-        .alert-red  { border-color: #e74c3c; background: #fdf3f3; }
+        .alert-red    { border-color: #e74c3c; background: #fdf3f3; }
         .alert-orange { border-color: #f39c12; background: #fef9f0; }
         .alert-green  { border-color: #27ae60; background: #f0faf4; }
         .metric-table th { background: #2980b9; color: white; }
         .info-box .info-box-icon { font-size: 28px; }
+        .sidebar-form .btn-block,
+        .main-sidebar .btn-block { margin-left: 0 !important; margin-right: 0 !important; }
       "))
     ),
     
@@ -212,9 +216,6 @@ server <- function(input, output, session) {
   
   manual_types <- reactiveVal(list())
   
-  # -------------------------------------------------------------------------
-  # Reactive: profilare fișier (FR-01)
-  # -------------------------------------------------------------------------
   data_info <- reactive({
     req(input$file)
     info <- profile_data(input$file$datapath)
@@ -228,9 +229,6 @@ server <- function(input, output, session) {
     info
   })
   
-  # -------------------------------------------------------------------------
-  # Reactive: citire date brute
-  # -------------------------------------------------------------------------
   data_raw <- reactive({
     req(input$file)
     fp <- input$file$datapath
@@ -242,9 +240,6 @@ server <- function(input, output, session) {
     }
   })
   
-  # -------------------------------------------------------------------------
-  # Reactive: procesare date (vârstă → grupe)
-  # -------------------------------------------------------------------------
   data_final <- reactive({
     req(data_raw())
     df <- as.data.frame(data_raw())
@@ -258,9 +253,6 @@ server <- function(input, output, session) {
     df
   })
   
-  # -------------------------------------------------------------------------
-  # Override manual tip coloană (FR-01)
-  # -------------------------------------------------------------------------
   observeEvent(input$apply_override, {
     req(input$override_col, input$override_type)
     ov <- manual_types()
@@ -272,10 +264,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # -------------------------------------------------------------------------
-  # Helper: coloane filtrate per tip
-  # NOTA: tipurile din Python sunt "Numerica", "Binara", "Categorica" (fara diacritice)
-  # -------------------------------------------------------------------------
   filtered_cols <- reactive({
     req(data_info())
     info  <- data_info()
@@ -290,7 +278,6 @@ server <- function(input, output, session) {
     )
   })
   
-  # La upload fișier nou: setează choices + selected (FR-02)
   observeEvent(input$file, {
     req(filtered_cols(), data_info())
     cols <- filtered_cols()
@@ -304,7 +291,6 @@ server <- function(input, output, session) {
     updateSelectInput(session, "socio_target_col", choices = cols$fin,  selected = cols$fin[1])
   })
   
-  # La override: reîmprospătează doar choices, păstrează selecția utilizatorului
   observeEvent(input$apply_override, {
     req(filtered_cols())
     cols <- filtered_cols()
@@ -369,7 +355,6 @@ server <- function(input, output, session) {
     info   <- data_info()
     t_type <- info$types[[input$target]]
     s_type <- info$types[[input$sensitive]]
-    
     if (!(s_type %in% c("Categorica", "Binara"))) {
       showNotification("Atributul sensibil trebuie să fie Categorică sau Binară (FR-02).", type = "error")
       return(NULL)
@@ -378,16 +363,12 @@ server <- function(input, output, session) {
       showNotification("Target-ul trebuie să fie Numeric sau Binar (FR-02).", type = "error")
       return(NULL)
     }
-    
     fp  <- input$file$datapath
     res <- if (t_type == "Numerica") compute_numeric_metrics(fp, input$sensitive, input$target)
     else                      compute_binary_metrics(fp, input$sensitive, input$target)
     py_to_r_safe(res)
   })
   
-  # -------------------------------------------------------------------------
-  # Reactive: alerte distribuționale (FR-05)
-  # -------------------------------------------------------------------------
   dist_alerts <- eventReactive(input$run, {
     req(input$file, input$sensitive, input$target)
     fp       <- input$file$datapath
@@ -396,9 +377,6 @@ server <- function(input, output, session) {
     list(skewness = skew_res, imbalance = imb_res)
   })
   
-  # -------------------------------------------------------------------------
-  # Reactive: Bias Score (FR-06)
-  # -------------------------------------------------------------------------
   bias_result <- eventReactive(input$run, {
     req(metrics_result(), dist_alerts())
     mr     <- metrics_result()
@@ -474,7 +452,6 @@ server <- function(input, output, session) {
     req(metrics_result(), data_info())
     mr     <- metrics_result()
     t_type <- data_info()$types[[input$target]]
-    
     if (t_type == "Numerica") {
       tagList(
         fluidRow(
@@ -537,7 +514,6 @@ server <- function(input, output, session) {
     tcol <- input$socio_target_col
     if (!(tcol %in% names(df))) return(NULL)
     df[[tcol]] <- suppressWarnings(as.numeric(df[[tcol]]))
-    
     if (type == "age") {
       age_col <- names(df)[str_detect(tolower(names(df)), "v[âa]rst[ăa]|^age$")]
       if (length(age_col) == 0) { showNotification("Nu s-a detectat o coloană de vârstă.", type = "warning"); return(NULL) }
@@ -552,7 +528,6 @@ server <- function(input, output, session) {
       if (length(reg_col) == 0) { showNotification("Nu s-a detectat o coloană de regiune/județ.", type = "warning"); return(NULL) }
       group_col <- reg_col[1]
     }
-    
     df %>%
       filter(!is.na(.data[[group_col]]), !is.na(.data[[tcol]])) %>%
       group_by(Grup = .data[[group_col]]) %>%
@@ -599,8 +574,8 @@ server <- function(input, output, session) {
     sign_lbl  <- if (diff_val >= 0) "mai mare" else "mai mic"
     color_cls <- if (diff_val < 0) "alert-orange" else "alert-green"
     tagList(
-      div(class = "alert-box alert-green",   strong("Media în date: "),            format(round(overall_mean, 0), big.mark = ".")),
-      div(class = "alert-box alert-orange",  strong(paste0("Referință (", ref_country, "): ")), format(ref_val, big.mark = ".")),
+      div(class = "alert-box alert-green",  strong("Media în date: "),                     format(round(overall_mean, 0), big.mark = ".")),
+      div(class = "alert-box alert-orange", strong(paste0("Referință (", ref_country, "): ")), format(ref_val, big.mark = ".")),
       div(class = paste("alert-box", color_cls), strong("Diferență: "),
           paste0(abs(round(diff_val, 0)), " (", abs(diff_pct), "% ", sign_lbl, ")"))
     )
@@ -615,7 +590,6 @@ server <- function(input, output, session) {
   # -------------------------------------------------------------------------
   # TAB VIZUALIZARE (FR-07)
   # -------------------------------------------------------------------------
-  
   output$plot_boxplot <- if (has_plotly) plotly::renderPlotly({
     req(data_final(), input$sensitive, input$target, input$run)
     df <- data_final()
@@ -737,7 +711,6 @@ server <- function(input, output, session) {
   # -------------------------------------------------------------------------
   # TAB EXPORT
   # -------------------------------------------------------------------------
-  
   make_boxplot_gg <- function() {
     req(data_final(), input$sensitive, input$target)
     df <- data_final()
@@ -797,19 +770,19 @@ server <- function(input, output, session) {
       mr <- metrics_result()
       br <- bias_result()
       lines <- c(
-        paste0("Data analizei,",   Sys.Date()),
+        paste0("Data analizei,",    Sys.Date()),
         paste0("Atribut sensibil,", input$sensitive),
         paste0("Target,",           input$target),
         paste0("Bias Score,",       br$bias_score),
         paste0("Severitate,",       br$severity), "")
       if (!is.null(mr$cohen_d))
         lines <- c(lines,
-                   paste0("Cohen d,",          mr$cohen_d),
-                   paste0("Interpretare,",     mr$cohen_d_interpretation),
-                   paste0("Diferenta medie,",  mr$mean_diff),
-                   paste0("Diferenta %,",      mr$pct_diff),
-                   paste0("t-stat,",           mr$t_stat),
-                   paste0("p-value t-test,",   mr$p_value_ttest))
+                   paste0("Cohen d,",         mr$cohen_d),
+                   paste0("Interpretare,",    mr$cohen_d_interpretation),
+                   paste0("Diferenta medie,", mr$mean_diff),
+                   paste0("Diferenta %,",     mr$pct_diff),
+                   paste0("t-stat,",          mr$t_stat),
+                   paste0("p-value t-test,",  mr$p_value_ttest))
       if (!is.null(mr$spd))
         lines <- c(lines,
                    paste0("SPD,",              mr$spd),

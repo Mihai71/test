@@ -1,9 +1,13 @@
-# logic.py - Backend Python pentru analiza disparitatilor (FR-01, FR-04, FR-05, FR-06)
+# logic.py - Backend Python pentru analiza disparităților (FR-01, FR-04, FR-05, FR-06)
 import pandas as pd
 import numpy as np
 import re
 import math
 
+
+# ---------------------------------------------------------------------------
+# Utilitar intern
+# ---------------------------------------------------------------------------
 
 def _load_file(file_path):
     fp = str(file_path).strip()
@@ -11,6 +15,40 @@ def _load_file(file_path):
         return pd.read_excel(fp)
     return pd.read_csv(fp)
 
+
+# Cuvinte cheie pentru valoarea pozitivă (succes/outcome favorabil)
+_POSITIVE_KEYWORDS = {
+    "da", "yes", "true", "1", "angajat", "prezent", "activ",
+    "pozitiv", "succes", "admis", "promovat", "aprobat", "accept"
+}
+_NEGATIVE_KEYWORDS = {
+    "nu", "no", "false", "0", "neangajat", "absent", "inactiv",
+    "negativ", "respins", "nepromovat", "refuzat"
+}
+
+def _detect_success_value(vals):
+    """
+    Detectează valoarea pozitivă (succes) dintr-o pereche binară.
+    Prioritizează cuvinte cheie cunoscute; fallback la valoarea alfabetic mai mare.
+    """
+    lookup = {str(v).lower().strip(): v for v in vals}
+    # Caută direct o valoare pozitivă
+    for kw in _POSITIVE_KEYWORDS:
+        if kw in lookup:
+            return lookup[kw]
+    # Dacă găsim o valoare negativă, returnăm cealaltă
+    for kw in _NEGATIVE_KEYWORDS:
+        if kw in lookup:
+            other = [v for v in vals if str(v).lower().strip() != kw]
+            if other:
+                return other[0]
+    # Fallback: ultima valoare sortată alfabetic
+    return sorted(vals, key=str)[-1]
+
+
+# ---------------------------------------------------------------------------
+# FR-01: Profilare date
+# ---------------------------------------------------------------------------
 
 def profile_data(file_path):
     try:
@@ -52,6 +90,10 @@ def profile_data(file_path):
         "n_cols": int(df.shape[1])
     }
 
+
+# ---------------------------------------------------------------------------
+# FR-05: Dezechilibru distributional și outlieri
+# ---------------------------------------------------------------------------
 
 def compute_distribution_alerts(file_path, col):
     try:
@@ -96,6 +138,10 @@ def compute_group_imbalance(file_path, col):
             alerts.append({"group": str(group), "pct": round(float(pct * 100), 2)})
     return alerts
 
+
+# ---------------------------------------------------------------------------
+# FR-04: Metrici de disparitate - target numeric
+# ---------------------------------------------------------------------------
 
 def compute_numeric_metrics(file_path, sensitive_col, target_col):
     try:
@@ -155,6 +201,10 @@ def compute_numeric_metrics(file_path, sensitive_col, target_col):
     return result
 
 
+# ---------------------------------------------------------------------------
+# FR-04: Metrici de disparitate - target binar
+# ---------------------------------------------------------------------------
+
 def compute_binary_metrics(file_path, sensitive_col, target_col):
     try:
         df = _load_file(file_path)
@@ -162,8 +212,10 @@ def compute_binary_metrics(file_path, sensitive_col, target_col):
         return {"error": str(e)}
 
     df = df.dropna(subset=[target_col, sensitive_col])
-    vals = sorted(df[target_col].dropna().unique(), key=str)
-    success_val = vals[-1]
+    unique_vals = df[target_col].dropna().unique().tolist()
+
+    # Detectare inteligentă a valorii pozitive (succes)
+    success_val = _detect_success_value(unique_vals)
 
     summary = []
     for name, grp in df.groupby(sensitive_col):
@@ -171,11 +223,17 @@ def compute_binary_metrics(file_path, sensitive_col, target_col):
         successes = int((grp[target_col] == success_val).sum())
         rate = successes / total if total > 0 else 0.0
         summary.append({
-            "Grup": str(name), "Total": total,
-            "Succese": successes, "Rata_Succes": round(float(rate), 4)
+            "Grup": str(name),
+            "Total": total,
+            "Succese": successes,
+            "Rata_Succes": round(float(rate), 4)
         })
 
-    result = {"summary": summary, "success_label": str(success_val), "n_groups": len(summary)}
+    result = {
+        "summary": summary,
+        "success_label": str(success_val),
+        "n_groups": len(summary)
+    }
 
     if len(summary) == 2:
         p1 = summary[0]["Rata_Succes"]
@@ -195,6 +253,10 @@ def compute_binary_metrics(file_path, sensitive_col, target_col):
 
     return result
 
+
+# ---------------------------------------------------------------------------
+# FR-06: Bias Score
+# ---------------------------------------------------------------------------
 
 def compute_bias_score(effect_size, group_proportions_list):
     effect_size = float(effect_size)
@@ -218,6 +280,10 @@ def compute_bias_score(effect_size, group_proportions_list):
         "imbalance_component": round(imbalance_penalty, 4)
     }
 
+
+# ---------------------------------------------------------------------------
+# Utilități statistice (fără scipy, implementare pură numpy)
+# ---------------------------------------------------------------------------
 
 def _welch_ttest(a, b):
     n1, n2 = len(a), len(b)
