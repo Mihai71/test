@@ -1324,3 +1324,814 @@ function(file_id, region_col, res) {
       "Toate regiunile au corespondent în datele de referință INS."
   )
 }
+# ============================================================
+# GRUP 8 — ANALIZĂ COMPLETĂ
+# ============================================================
+
+#* Raport complet de bias: rulează toate metricile relevante într-un singur apel
+#* Detectează automat tipul target-ului și alege metricile potrivite.
+#* Pentru atribute cu 3+ grupuri, metricile pereche necesită group1 și group2.
+#* @tag Analiză Completă
+#* @post /analyze
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil (binary sau categorical)
+#* @param target_col Coloana target (numeric sau binary)
+#* @param positive_value Valoarea pozitivă pentru target binar (opțional, detectată automat)
+#* @param group1 Grup 1 pentru comparație pereche (opțional dacă sunt 3+ grupuri)
+#* @param group2 Grup 2 pentru comparație pereche (opțional dacă sunt 3+ grupuri)
+#* @serializer json
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!sensitive_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", sensitive_col)))
+  }
+  if (!target_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", target_col)))
+  }
+  
+  target_type   <- detect_col_type(df[[target_col]])
+  sensitive_type <- detect_col_type(df[[sensitive_col]])
+  n_sens_groups <- length(unique(df[[sensitive_col]][!is.na(df[[sensitive_col]])]))
+  
+  has_pairwise  <- (!is.null(group1) && !is.null(group2) &&
+                      trimws(group1) != "" && trimws(group2) != "") ||
+    n_sens_groups == 2
+  
+  report <- list(
+    file_id       = file_id,
+    filename      = entry$filename,
+    sensitive_col = sensitive_col,
+    target_col    = target_col,
+    target_type   = target_type,
+    n_rows        = nrow(df),
+    n_sens_groups = n_sens_groups,
+    pairwise_mode = has_pairwise,
+    group1        = if (has_pairwise && n_sens_groups > 2) group1 else NULL,
+    group2        = if (has_pairwise && n_sens_groups > 2) group2 else NULL,
+    generated_at  = as.character(Sys.time())
+  )
+  
+  # ── 1. Alerte calitate ──────────────────────────────────────
+  # Valori lipsă
+  n_rows   <- nrow(df)
+  miss_sens <- sum(is.na(df[[sensitive_col]]))
+  miss_tgt  <- sum(is.na(df[[target_col]]))
+  report$quality <- list(
+    missing = list(
+      sensitive_col = list(count = miss_sens,
+                           pct   = round(miss_sens / n_rows * 100, 2),
+                           ok    = miss_sens / n_rows <= 0.05),
+      target_col    = list(count = miss_tgt,
+                           pct   = round(miss_tgt / n_rows * 100, 2),
+                           ok    = miss_tgt / n_rows <= 0.05)
+    )
+  )
+  
+  # Dezechilibru grupuri sensibile
+  sens_vals  <- df[[sensitive_col]][!is.na(df[[sensitive_col]])]
+  sens_props <- table(sens_vals) / length(sens_vals)
+  min_prop   <- unname(min(sens_props))
+  report$quality$imbalance <- list(
+    min_group_proportion = round(min_prop, 4),
+    imbalanced           = min_prop < 0.20,
+    severity             = if (min_prop < 0.20) "critica" else "ok"
+  )
+  
+  # Distribuție target (doar dacă numeric)
+  if (target_type == "numeric") {
+    x <- df[[target_col]][!is.na(df[[target_col]])]
+    if (length(x) >= 4) {
+      skew    <- compute_skewness(x)
+      q1      <- unname(quantile(x, 0.25))
+      q3      <- unname(quantile(x, 0.75))
+      iqr     <- q3 - q1
+      lf      <- q1 - 1.5 * iqr
+      uf      <- q3 + 1.5 * iqr
+      n_out   <- sum(x < lf | x > uf)
+      report$quality$distribution <- list(
+        skewness         = round(skew, 4),
+        skew_level       = if (abs(skew) <= 0.5) "simetrica"
+        else if (abs(skew) <= 1) "asimetrie_moderata"
+        else "asimetrie_puternica",
+        outlier_count    = n_out,
+        outlier_pct      = round(n_out / length(x) * 100, 2),
+        outlier_severity = if (n_out / length(x) * 100 > 10) "critica"
+        else if (n_out / length(x) * 100 > 5) "atentie"
+        else "ok"
+      )
+    }
+  }
+  
+  # ── 2. Metrici numerice ─────────────────────────────────────
+  if (target_type == "numeric") {
+    r <- get_numeric_groups(file_id, sensitive_col, target_col)
+    
+    if (!is.null(r$error)) {
+      report$metrics_numeric <- list(error = r$error)
+    } else {
+      # Statistici descriptive — toate grupurile
+      report$metrics_numeric <- list()
+      report$metrics_numeric$descriptive <- lapply(names(r$groups), function(g) {
+        vals <- r$groups[[g]]
+        list(group  = g, count = length(vals),
+             mean   = round(mean(vals), 4), median = round(median(vals), 4),
+             std    = round(sd(vals), 4),   min    = round(min(vals), 4),
+             max    = round(max(vals), 4))
+      })
+      
+      # ANOVA — toate grupurile (mereu calculat)
+      df_anova  <- data.frame(value = r$df_clean[[target_col]],
+                              group = as.factor(r$df_clean[[sensitive_col]]))
+      anova_res <- tryCatch(
+        oneway.test(value ~ group, data = df_anova, var.equal = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(anova_res)) {
+        report$metrics_numeric$anova <- list(
+          f_statistic    = round(unname(anova_res$statistic), 4),
+          p_value        = round(anova_res$p.value, 6),
+          df_numerator   = round(unname(anova_res$parameter[1]), 2),
+          df_denominator = round(unname(anova_res$parameter[2]), 2),
+          significant    = anova_res$p.value < 0.05,
+          n_groups       = r$n_groups,
+          method         = "Welch one-way ANOVA"
+        )
+      }
+      
+      # Metrici pereche — doar dacă are 2 grupuri sau group1/group2 specificat
+      if (has_pairwise) {
+        f <- filter_two_groups(r$groups, group1, group2, sensitive_col)
+        if (!is.null(f$error)) {
+          report$metrics_numeric$pairwise_error <- f$error
+        } else {
+          x1 <- f$groups[[f$g1]]; x2 <- f$groups[[f$g2]]
+          n1 <- length(x1);       n2 <- length(x2)
+          sd_pooled <- sqrt(((n1-1)*var(x1) + (n2-1)*var(x2)) / (n1+n2-2))
+          d         <- if (sd_pooled == 0) 0 else (mean(x1) - mean(x2)) / sd_pooled
+          tt        <- tryCatch(t.test(x1, x2, var.equal = FALSE), error = function(e) NULL)
+          
+          report$metrics_numeric$mean_diff <- list(
+            group1   = f$g1, group2 = f$g2,
+            mean1    = round(mean(x1), 4), mean2 = round(mean(x2), 4),
+            abs_diff = round(mean(x1) - mean(x2), 4),
+            pct_diff = round((mean(x1) - mean(x2)) / abs(mean(x2)) * 100, 2)
+          )
+          
+          report$metrics_numeric$cohens_d <- list(
+            group1       = f$g1, group2 = f$g2,
+            cohens_d     = round(d, 4),
+            cohens_d_abs = round(abs(d), 4),
+            magnitude    = cohens_d_magnitude(d),
+            sd_pooled    = round(sd_pooled, 4)
+          )
+          
+          if (!is.null(tt)) {
+            report$metrics_numeric$welch_ttest <- list(
+              group1              = f$g1, group2 = f$g2,
+              t_statistic         = round(unname(tt$statistic), 4),
+              p_value             = round(tt$p.value, 6),
+              degrees_of_freedom  = round(unname(tt$parameter), 2),
+              significant         = tt$p.value < 0.05,
+              confidence_interval = list(lower = round(tt$conf.int[1], 4),
+                                         upper = round(tt$conf.int[2], 4))
+            )
+          }
+        }
+      } else {
+        report$metrics_numeric$pairwise_note <-
+          sprintf("Atribut cu %d grupuri. Specificați group1 și group2 pentru metrici pereche.",
+                  n_sens_groups)
+      }
+    }
+    
+    # ── 3. Metrici binare ───────────────────────────────────────
+  } else if (target_type == "binary") {
+    r <- get_binary_groups(file_id, sensitive_col, target_col,
+                           positive_value, group1, group2)
+    if (!is.null(r$error)) {
+      report$metrics_binary <- list(error = r$error)
+    } else {
+      p_priv <- r$privileged$proportion
+      p_prot <- r$protected$proportion
+      spd    <- p_priv - p_prot
+      di     <- if (p_priv > 0) p_prot / p_priv else NA
+      
+      report$metrics_binary <- list(
+        positive_value   = r$positive_value,
+        group_privileged = list(name = r$privileged$group, count = r$privileged$count,
+                                n_positive = r$privileged$n_positive,
+                                proportion = round(p_priv, 4)),
+        group_protected  = list(name = r$protected$group, count = r$protected$count,
+                                n_positive = r$protected$n_positive,
+                                proportion = round(p_prot, 4)),
+        spd = list(
+          value          = round(spd, 4),
+          pct            = round(spd * 100, 2),
+          equitable      = abs(spd) < 0.1,
+          interpretation = if (abs(spd) < 0.1) "echitabil"
+          else if (spd > 0) "grupul protejat are rata mai mică"
+          else "grupul protejat are rata mai mare"
+        ),
+        disparate_impact = if (!is.na(di)) list(
+          value          = round(di, 4),
+          equitable      = di >= 0.8 && di <= 1.25,
+          interpretation = if (di >= 0.8 && di <= 1.25) "echitabil"
+          else if (di < 0.8) "risc de discriminare"
+          else "favorizare inversă",
+          rule_80_pct    = list(lower = 0.8, upper = 1.25)
+        ) else list(error = "Proporție 0 — DI nu poate fi calculat")
+      )
+    }
+    
+  } else {
+    report$metrics_error <- sprintf(
+      "Target '%s' este de tip '%s' — trebuie să fie numeric sau binary.",
+      target_col, target_type
+    )
+  }
+  
+  # ── 4. Bias score ───────────────────────────────────────────
+  imbalance_penalty <- if (min_prop >= 0.20) 0
+  else (0.20 - min_prop) / 0.20
+  
+  if (target_type == "numeric" && is.null(report$metrics_numeric$error)) {
+    r_num <- get_numeric_groups(file_id, sensitive_col, target_col)
+    use_pw <- has_pairwise && is.null(report$metrics_numeric$pairwise_error)
+    if (use_pw) {
+      f <- filter_two_groups(r_num$groups, group1, group2, sensitive_col)
+      if (is.null(f$error)) {
+        x1 <- f$groups[[f$g1]]; x2 <- f$groups[[f$g2]]
+        n1 <- length(x1);       n2 <- length(x2)
+        sd_p     <- sqrt(((n1-1)*var(x1) + (n2-1)*var(x2)) / (n1+n2-2))
+        d_val    <- if (sd_p == 0) 0 else (mean(x1) - mean(x2)) / sd_p
+        eff_norm <- min(abs(d_val), 1.0)
+        eff_lbl  <- "Cohen's d"
+        eff_val  <- round(d_val, 4)
+      } else { use_pw <- FALSE }
+    }
+    if (!use_pw) {
+      eta2     <- compute_eta_squared(r_num$groups)
+      eff_norm <- eta2
+      eff_lbl  <- "eta-squared (η²) — toate grupurile"
+      eff_val  <- round(eta2, 4)
+    }
+  } else if (target_type == "binary" && is.null(report$metrics_binary$error)) {
+    r_bin    <- get_binary_groups(file_id, sensitive_col, target_col,
+                                  positive_value, group1, group2)
+    spd_val  <- r_bin$privileged$proportion - r_bin$protected$proportion
+    eff_norm <- min(abs(spd_val), 1.0)
+    eff_lbl  <- "SPD"
+    eff_val  <- round(spd_val, 4)
+  } else {
+    eff_norm <- NA; eff_lbl <- NA; eff_val <- NA
+  }
+  
+  if (!is.na(eff_norm)) {
+    bias_score <- min(0.7 * eff_norm + 0.3 * imbalance_penalty, 1.0)
+    severity   <- if (bias_score < 0.20) "neglijabil"
+    else if (bias_score < 0.50) "moderat"
+    else "ridicat"
+    
+    report$bias_score <- list(
+      effect_metric     = eff_lbl,
+      effect_value      = eff_val,
+      effect_norm       = round(eff_norm, 4),
+      imbalance_penalty = round(imbalance_penalty, 4),
+      bias_score        = round(bias_score, 4),
+      severity          = severity,
+      formula           = "min(0.7 * effect_norm + 0.3 * imbalance_penalty, 1.0)",
+      thresholds        = list(neglijabil = 0.20, moderat = 0.50)
+    )
+  }
+  
+  report
+}
+# ============================================================
+# GRUP 9 — VIZUALIZĂRI
+# ============================================================
+
+# ── Helper: renderizează un plot R în base64 PNG ──────────────
+plot_to_base64 <- function(plot_fn, width = 700, height = 450) {
+  tmp <- tempfile(fileext = ".png")
+  on.exit(unlink(tmp))
+  png(tmp, width = width, height = height, res = 96)
+  tryCatch(plot_fn(), finally = dev.off())
+  raw_bytes <- readBin(tmp, "raw", file.info(tmp)$size)
+  jsonlite::base64_enc(raw_bytes)
+}
+
+PLOT_COLORS <- c("#2196F3", "#F44336", "#4CAF50", "#FF9800",
+                 "#9C27B0", "#00BCD4", "#795548", "#607D8B")
+
+#* Boxplot al target-ului numeric grupat după atributul sensibil
+#* @tag Vizualizări
+#* @post /viz/boxplot
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil (orice număr de grupuri)
+#* @param target_col Coloana numerică analizată
+#* @serializer json
+function(file_id, sensitive_col, target_col, res) {
+  r <- get_numeric_groups(file_id, sensitive_col, target_col)
+  if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+  
+  img <- plot_to_base64(function() {
+    colors <- rep_len(PLOT_COLORS, length(r$groups))
+    par(mar = c(6, 5, 4, 2))
+    boxplot(r$groups,
+            col      = colors,
+            border   = "gray30",
+            main     = sprintf("Distribuție %s pe %s", target_col, sensitive_col),
+            xlab     = "",
+            ylab     = target_col,
+            las      = 2,
+            cex.axis = 0.8)
+    mtext(sensitive_col, side = 1, line = 5)
+    grand_mean <- mean(unlist(r$groups))
+    abline(h = grand_mean, lty = 2, col = "gray50")
+    legend("topright",
+           legend = sprintf("medie globală: %.2f", grand_mean),
+           lty = 2, col = "gray50", bty = "n", cex = 0.8)
+  })
+  
+  list(file_id = file_id, sensitive_col = sensitive_col, target_col = target_col,
+       n_groups = r$n_groups, format = "png", image_base64 = img)
+}
+
+#* Curbe de densitate ale target-ului numeric pe grupuri
+#* @tag Vizualizări
+#* @post /viz/density
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil (orice număr de grupuri)
+#* @param target_col Coloana numerică analizată
+#* @serializer json
+function(file_id, sensitive_col, target_col, res) {
+  r <- get_numeric_groups(file_id, sensitive_col, target_col)
+  if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+  
+  valid_groups <- Filter(function(g) length(g) >= 3, r$groups)
+  if (length(valid_groups) == 0) {
+    res$status <- 422
+    return(list(error = "Niciunul dintre grupuri nu are minimum 3 valori pentru estimarea densității."))
+  }
+  
+  img <- plot_to_base64(function() {
+    dens   <- lapply(valid_groups, density)
+    x_rng  <- range(sapply(dens, function(d) d$x))
+    y_rng  <- c(0, max(sapply(dens, function(d) d$y)) * 1.15)
+    colors <- rep_len(PLOT_COLORS, length(valid_groups))
+    par(mar = c(5, 5, 4, 2))
+    plot(dens[[1]], xlim = x_rng, ylim = y_rng,
+         col  = colors[1], lwd = 2,
+         main = sprintf("Densitate %s pe %s", target_col, sensitive_col),
+         xlab = target_col, ylab = "Densitate")
+    if (length(valid_groups) > 1) {
+      for (i in seq(2, length(valid_groups))) {
+        lines(dens[[i]], col = colors[i], lwd = 2)
+      }
+    }
+    legend("topright", legend = names(valid_groups),
+           col = colors, lwd = 2, bty = "n", cex = 0.8)
+  })
+  
+  list(file_id = file_id, sensitive_col = sensitive_col, target_col = target_col,
+       n_groups = length(valid_groups), format = "png", image_base64 = img)
+}
+
+#* Bar chart proporții per grup pentru target binar
+#* @tag Vizualizări
+#* @post /viz/barplot
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana binară analizată
+#* @param positive_value Valoarea considerată succes (opțional, detectată automat)
+#* @param group1 Grup 1 (opțional dacă sunt 3+ grupuri)
+#* @param group2 Grup 2 (opțional dacă sunt 3+ grupuri)
+#* @serializer json
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  r <- get_binary_groups(file_id, sensitive_col, target_col,
+                         positive_value, group1, group2)
+  if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+  
+  grp_names <- c(r$privileged$group, r$protected$group)
+  props     <- c(r$privileged$proportion, r$protected$proportion)
+  
+  img <- plot_to_base64(function() {
+    colors <- c(PLOT_COLORS[1], PLOT_COLORS[2])
+    par(mar = c(5, 5, 4, 2))
+    bp <- barplot(props * 100,
+                  names.arg = grp_names,
+                  col       = colors,
+                  border    = "gray30",
+                  ylim      = c(0, max(props * 100) * 1.3),
+                  main      = sprintf("Rata '%s' pe %s", r$positive_value, sensitive_col),
+                  xlab      = sensitive_col,
+                  ylab      = sprintf("Proporție '%s' (%%)", r$positive_value))
+    prag_di <- r$privileged$proportion * 100 * 0.8
+    abline(h = prag_di, lty = 2, col = "red", lwd = 1.5)
+    text(x = mean(bp), y = prag_di + 1.5,
+         labels = sprintf("prag 80%% DI (%.1f%%)", prag_di),
+         col = "red", cex = 0.8)
+    text(x = bp, y = props * 100 + 2,
+         labels = sprintf("%.1f%%", props * 100), cex = 0.9, font = 2)
+  })
+  
+  list(file_id = file_id, sensitive_col = sensitive_col, target_col = target_col,
+       positive_value = r$positive_value, format = "png", image_base64 = img)
+}
+
+#* Grafic de paritate: SPD și DI față de praguri echitabile
+#* @tag Vizualizări
+#* @post /viz/parity
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana binară analizată
+#* @param positive_value Valoarea considerată succes (opțional, detectată automat)
+#* @param group1 Grup 1 (opțional dacă sunt 3+ grupuri)
+#* @param group2 Grup 2 (opțional dacă sunt 3+ grupuri)
+#* @serializer json
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  r <- get_binary_groups(file_id, sensitive_col, target_col,
+                         positive_value, group1, group2)
+  if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+  
+  p_priv <- r$privileged$proportion
+  p_prot <- r$protected$proportion
+  spd    <- p_priv - p_prot
+  di     <- if (p_priv > 0) p_prot / p_priv else NA
+  
+  img <- plot_to_base64(function() {
+    par(mar = c(4, 10, 4, 5))
+    
+    vals   <- c(spd, if (!is.na(di)) di else 0)
+    labels <- c("SPD", "DI")
+    colors <- c(
+      if (abs(spd) < 0.1) "#4CAF50" else "#F44336",
+      if (!is.na(di) && di >= 0.8 && di <= 1.25) "#4CAF50" else "#F44336"
+    )
+    
+    x_min <- min(c(vals, -0.15, 0.75))
+    x_max <- max(c(vals,  0.15, 1.30))
+    
+    plot(vals, 1:2, xlim = c(x_min, x_max), ylim = c(0.5, 2.5),
+         pch = 19, cex = 3, col = colors, yaxt = "n",
+         main = sprintf("Paritate: %s vs %s\n(pozitiv='%s')",
+                        r$protected$group, r$privileged$group, r$positive_value),
+         xlab = "Valoare metrică", ylab = "")
+    axis(2, at = 1:2, labels = labels, las = 2, cex.axis = 1.1)
+    
+    abline(v =  0,    lty = 2, col = "gray60")
+    abline(v =  1,    lty = 2, col = "gray60")
+    abline(v =  0.1,  lty = 3, col = "tomato",  lwd = 1.5)
+    abline(v = -0.1,  lty = 3, col = "tomato",  lwd = 1.5)
+    abline(v =  0.8,  lty = 3, col = "orange",  lwd = 1.5)
+    abline(v =  1.25, lty = 3, col = "orange",  lwd = 1.5)
+    
+    text(vals, (1:2) + 0.25, labels = sprintf("%.4f", vals), cex = 0.85, font = 2)
+    
+    legend("bottomright",
+           legend = c("echitabil", "inechitabil", "prag DI [0.8–1.25]", "prag SPD [−0.1, 0.1]"),
+           col    = c("#4CAF50", "#F44336", "orange", "tomato"),
+           pch    = c(19, 19, NA, NA), lty = c(NA, NA, 3, 3),
+           pt.cex = 1.5, bty = "n", cex = 0.78)
+  })
+  
+  list(
+    file_id          = file_id,
+    sensitive_col    = sensitive_col,
+    target_col       = target_col,
+    positive_value   = r$positive_value,
+    group_privileged = r$privileged$group,
+    group_protected  = r$protected$group,
+    spd              = round(spd, 4),
+    di               = if (!is.na(di)) round(di, 4) else NULL,
+    format           = "png",
+    image_base64     = img
+  )
+}
+
+# ============================================================
+# GRUP 10 — EXPORT
+# ============================================================
+
+.build_report <- function(file_id, sensitive_col, target_col,
+                          positive_value, group1, group2) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry))
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  df <- entry$df
+  if (!sensitive_col %in% colnames(df))
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", sensitive_col)))
+  if (!target_col %in% colnames(df))
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", target_col)))
+  
+  target_type   <- detect_col_type(df[[target_col]])
+  n_sens_groups <- length(unique(df[[sensitive_col]][!is.na(df[[sensitive_col]])]))
+  has_pairwise  <- (!is.null(group1) && !is.null(group2) &&
+                      trimws(group1) != "" && trimws(group2) != "") ||
+    n_sens_groups == 2
+  
+  report <- list(
+    file_id=file_id, filename=entry$filename,
+    sensitive_col=sensitive_col, target_col=target_col,
+    target_type=target_type, n_rows=nrow(df),
+    n_sens_groups=n_sens_groups, pairwise_mode=has_pairwise,
+    group1=if(has_pairwise&&n_sens_groups>2) group1 else NULL,
+    group2=if(has_pairwise&&n_sens_groups>2) group2 else NULL,
+    generated_at=as.character(Sys.time())
+  )
+  
+  n_rows <- nrow(df)
+  miss_sens <- sum(is.na(df[[sensitive_col]])); miss_tgt <- sum(is.na(df[[target_col]]))
+  sens_vals <- df[[sensitive_col]][!is.na(df[[sensitive_col]])]
+  sens_props <- table(sens_vals)/length(sens_vals); min_prop <- unname(min(sens_props))
+  
+  report$quality <- list(
+    missing=list(
+      sensitive_col=list(count=miss_sens, pct=round(miss_sens/n_rows*100,2), ok=miss_sens/n_rows<=0.05),
+      target_col=list(count=miss_tgt, pct=round(miss_tgt/n_rows*100,2), ok=miss_tgt/n_rows<=0.05)
+    ),
+    imbalance=list(min_group_proportion=round(min_prop,4), imbalanced=min_prop<0.20,
+                   severity=if(min_prop<0.20)"critica" else "ok")
+  )
+  
+  if (target_type=="numeric") {
+    x <- df[[target_col]][!is.na(df[[target_col]])]
+    if (length(x)>=4) {
+      skew <- compute_skewness(x)
+      q1 <- unname(quantile(x,0.25)); q3 <- unname(quantile(x,0.75))
+      n_out <- sum(x<(q1-1.5*(q3-q1))|x>(q3+1.5*(q3-q1)))
+      report$quality$distribution <- list(
+        skewness=round(skew,4),
+        skew_level=if(abs(skew)<=0.5)"simetrica" else if(abs(skew)<=1)"asimetrie_moderata" else "asimetrie_puternica",
+        outlier_count=n_out, outlier_pct=round(n_out/length(x)*100,2),
+        outlier_severity=if(n_out/length(x)*100>10)"critica" else if(n_out/length(x)*100>5)"atentie" else "ok"
+      )
+    }
+  }
+  
+  if (target_type=="numeric") {
+    r <- get_numeric_groups(file_id, sensitive_col, target_col)
+    if (!is.null(r$error)) {
+      report$metrics_numeric <- list(error=r$error)
+    } else {
+      report$metrics_numeric <- list()
+      report$metrics_numeric$descriptive <- lapply(names(r$groups), function(g) {
+        vals <- r$groups[[g]]
+        list(group=g, count=length(vals), mean=round(mean(vals),4), median=round(median(vals),4),
+             std=round(sd(vals),4), min=round(min(vals),4), max=round(max(vals),4))
+      })
+      df_a <- data.frame(value=r$df_clean[[target_col]], group=as.factor(r$df_clean[[sensitive_col]]))
+      ar   <- tryCatch(oneway.test(value~group, data=df_a, var.equal=FALSE), error=function(e) NULL)
+      if (!is.null(ar))
+        report$metrics_numeric$anova <- list(f_statistic=round(unname(ar$statistic),4),
+                                             p_value=round(ar$p.value,6), significant=ar$p.value<0.05,
+                                             n_groups=r$n_groups, method="Welch one-way ANOVA")
+      if (has_pairwise) {
+        f <- filter_two_groups(r$groups, group1, group2, sensitive_col)
+        if (!is.null(f$error)) {
+          report$metrics_numeric$pairwise_error <- f$error
+        } else {
+          x1<-f$groups[[f$g1]]; x2<-f$groups[[f$g2]]; n1<-length(x1); n2<-length(x2)
+          sd_p <- sqrt(((n1-1)*var(x1)+(n2-1)*var(x2))/(n1+n2-2))
+          d    <- if(sd_p==0) 0 else (mean(x1)-mean(x2))/sd_p
+          tt   <- tryCatch(t.test(x1,x2,var.equal=FALSE), error=function(e) NULL)
+          report$metrics_numeric$mean_diff <- list(group1=f$g1,group2=f$g2,
+                                                   mean1=round(mean(x1),4),mean2=round(mean(x2),4),
+                                                   abs_diff=round(mean(x1)-mean(x2),4),pct_diff=round((mean(x1)-mean(x2))/abs(mean(x2))*100,2))
+          report$metrics_numeric$cohens_d <- list(group1=f$g1,group2=f$g2,
+                                                  cohens_d=round(d,4),cohens_d_abs=round(abs(d),4),magnitude=cohens_d_magnitude(d))
+          if (!is.null(tt))
+            report$metrics_numeric$welch_ttest <- list(group1=f$g1,group2=f$g2,
+                                                       t_statistic=round(unname(tt$statistic),4),p_value=round(tt$p.value,6),significant=tt$p.value<0.05)
+        }
+      } else {
+        report$metrics_numeric$pairwise_note <- sprintf(
+          "Atribut cu %d grupuri. Specificați group1 și group2 pentru metrici pereche.", n_sens_groups)
+      }
+    }
+  } else if (target_type=="binary") {
+    r <- get_binary_groups(file_id, sensitive_col, target_col, positive_value, group1, group2)
+    if (!is.null(r$error)) {
+      report$metrics_binary <- list(error=r$error)
+    } else {
+      p_priv <- r$privileged$proportion; p_prot <- r$protected$proportion
+      spd <- p_priv-p_prot; di <- if(p_priv>0) p_prot/p_priv else NA
+      report$metrics_binary <- list(
+        positive_value=r$positive_value,
+        group_privileged=list(name=r$privileged$group,count=r$privileged$count,
+                              n_positive=r$privileged$n_positive,proportion=round(p_priv,4)),
+        group_protected=list(name=r$protected$group,count=r$protected$count,
+                             n_positive=r$protected$n_positive,proportion=round(p_prot,4)),
+        spd=list(value=round(spd,4),pct=round(spd*100,2),equitable=abs(spd)<0.1,
+                 interpretation=if(abs(spd)<0.1)"echitabil" else if(spd>0)"grupul protejat are rata mai mică" else "grupul protejat are rata mai mare"),
+        disparate_impact=if(!is.na(di)) list(value=round(di,4),equitable=di>=0.8&&di<=1.25,
+                                             interpretation=if(di>=0.8&&di<=1.25)"echitabil" else if(di<0.8)"risc de discriminare" else "favorizare inversă",
+                                             rule_80_pct=list(lower=0.8,upper=1.25))
+        else list(error="Proporție 0 — DI nu poate fi calculat")
+      )
+    }
+  }
+  
+  imbalance_penalty <- if(min_prop>=0.20) 0 else (0.20-min_prop)/0.20
+  eff_norm <- NA; eff_lbl <- NA; eff_val <- NA
+  
+  if (target_type=="numeric" && is.null(report$metrics_numeric$error)) {
+    r_num <- get_numeric_groups(file_id, sensitive_col, target_col)
+    use_pw <- has_pairwise && is.null(report$metrics_numeric$pairwise_error)
+    if (use_pw) {
+      f <- filter_two_groups(r_num$groups, group1, group2, sensitive_col)
+      if (is.null(f$error)) {
+        x1<-f$groups[[f$g1]]; x2<-f$groups[[f$g2]]; n1<-length(x1); n2<-length(x2)
+        sd_p <- sqrt(((n1-1)*var(x1)+(n2-1)*var(x2))/(n1+n2-2))
+        d    <- if(sd_p==0) 0 else (mean(x1)-mean(x2))/sd_p
+        eff_norm <- min(abs(d),1.0); eff_lbl <- "Cohen's d"; eff_val <- round(d,4)
+      }
+    }
+    if (is.na(eff_norm)) {
+      eta2 <- compute_eta_squared(r_num$groups)
+      eff_norm <- eta2; eff_lbl <- "eta-squared (η²)"; eff_val <- round(eta2,4)
+    }
+  } else if (target_type=="binary" && is.null(report$metrics_binary$error)) {
+    r_bin <- get_binary_groups(file_id, sensitive_col, target_col, positive_value, group1, group2)
+    spd_v <- r_bin$privileged$proportion-r_bin$protected$proportion
+    eff_norm <- min(abs(spd_v),1.0); eff_lbl <- "SPD"; eff_val <- round(spd_v,4)
+  }
+  
+  if (!is.na(eff_norm)) {
+    bs <- min(0.7*eff_norm+0.3*imbalance_penalty, 1.0)
+    report$bias_score <- list(
+      effect_metric=eff_lbl, effect_value=eff_val, effect_norm=round(eff_norm,4),
+      imbalance_penalty=round(imbalance_penalty,4), bias_score=round(bs,4),
+      severity=if(bs<0.20)"neglijabil" else if(bs<0.50)"moderat" else "ridicat",
+      formula="min(0.7 * effect_norm + 0.3 * imbalance_penalty, 1.0)"
+    )
+  }
+  report
+}
+
+.write_charts <- function(tmp_dir, file_id, sensitive_col, target_col,
+                          positive_value, group1, group2, target_type) {
+  if (target_type=="numeric") {
+    r <- get_numeric_groups(file_id, sensitive_col, target_col)
+    if (!is.null(r$error)) return(invisible(NULL))
+    png(file.path(tmp_dir,"boxplot.png"), width=700, height=450, res=96)
+    tryCatch({
+      colors <- rep_len(PLOT_COLORS, length(r$groups))
+      par(mar=c(6,5,4,2))
+      boxplot(r$groups, col=colors, border="gray30", las=2, cex.axis=0.8,
+              main=sprintf("Distribuție %s pe %s", target_col, sensitive_col), xlab="", ylab=target_col)
+      mtext(sensitive_col, side=1, line=5)
+      abline(h=mean(unlist(r$groups)), lty=2, col="gray50")
+    }, finally=dev.off())
+    valid_g <- Filter(function(g) length(g)>=3, r$groups)
+    if (length(valid_g)>0) {
+      png(file.path(tmp_dir,"density.png"), width=700, height=450, res=96)
+      tryCatch({
+        dens   <- lapply(valid_g, density)
+        x_rng  <- range(sapply(dens,function(d) d$x)); y_rng <- c(0,max(sapply(dens,function(d) d$y))*1.15)
+        colors <- rep_len(PLOT_COLORS, length(valid_g))
+        par(mar=c(5,5,4,2))
+        plot(dens[[1]], xlim=x_rng, ylim=y_rng, col=colors[1], lwd=2,
+             main=sprintf("Densitate %s pe %s", target_col, sensitive_col), xlab=target_col, ylab="Densitate")
+        if (length(valid_g)>1) for(i in 2:length(valid_g)) lines(dens[[i]], col=colors[i], lwd=2)
+        legend("topright", legend=names(valid_g), col=colors, lwd=2, bty="n", cex=0.8)
+      }, finally=dev.off())
+    }
+  } else if (target_type=="binary") {
+    r <- get_binary_groups(file_id, sensitive_col, target_col, positive_value, group1, group2)
+    if (!is.null(r$error)) return(invisible(NULL))
+    grp_names <- c(r$privileged$group,r$protected$group)
+    props     <- c(r$privileged$proportion,r$protected$proportion)
+    png(file.path(tmp_dir,"barplot.png"), width=700, height=450, res=96)
+    tryCatch({
+      par(mar=c(5,5,4,2))
+      bp <- barplot(props*100, names.arg=grp_names, col=PLOT_COLORS[1:2], border="gray30",
+                    ylim=c(0,max(props*100)*1.3),
+                    main=sprintf("Rata '%s' pe %s", r$positive_value, sensitive_col),
+                    xlab=sensitive_col, ylab=sprintf("Proporție '%s' (%%)", r$positive_value))
+      abline(h=r$privileged$proportion*100*0.8, lty=2, col="red", lwd=1.5)
+      text(mean(bp), r$privileged$proportion*100*0.8+1.5, labels="prag 80% DI", col="red", cex=0.8)
+      text(bp, props*100+2, labels=sprintf("%.1f%%",props*100), cex=0.9, font=2)
+    }, finally=dev.off())
+    p_priv <- r$privileged$proportion; p_prot <- r$protected$proportion
+    spd    <- p_priv-p_prot; di <- if(p_priv>0) p_prot/p_priv else NA
+    png(file.path(tmp_dir,"parity.png"), width=700, height=450, res=96)
+    tryCatch({
+      par(mar=c(4,10,4,5))
+      vals   <- c(spd, if(!is.na(di)) di else 0)
+      colors <- c(if(abs(spd)<0.1)"#4CAF50" else "#F44336",
+                  if(!is.na(di)&&di>=0.8&&di<=1.25)"#4CAF50" else "#F44336")
+      plot(vals, 1:2, xlim=c(min(c(vals,-0.15,0.75)),max(c(vals,0.15,1.30))), ylim=c(0.5,2.5),
+           pch=19, cex=3, col=colors, yaxt="n",
+           main=sprintf("Paritate: %s vs %s", r$protected$group, r$privileged$group),
+           xlab="Valoare metrică", ylab="")
+      axis(2, at=1:2, labels=c("SPD","DI"), las=2, cex.axis=1.1)
+      abline(v=c(0,1), lty=2, col="gray60")
+      abline(v=c(-0.1,0.1), lty=3, col="tomato", lwd=1.5)
+      abline(v=c(0.8,1.25), lty=3, col="orange", lwd=1.5)
+      text(vals, (1:2)+0.25, labels=sprintf("%.4f",vals), cex=0.85, font=2)
+    }, finally=dev.off())
+  }
+}
+
+#* Export raport complet ca fișier JSON descărcabil
+#* @tag Export
+#* @post /export/report
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana target (numeric sau binary)
+#* @param positive_value Valoarea pozitivă pentru target binar (opțional)
+#* @param group1 Grup 1 pentru comparație pereche (opțional)
+#* @param group2 Grup 2 pentru comparație pereche (opțional)
+#* @serializer contentType list(type="application/json")
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  report <- .build_report(file_id, sensitive_col, target_col, positive_value, group1, group2)
+  if (!is.null(report$error)) {
+    res$status <- 400
+    return(charToRaw(jsonlite::toJSON(report, auto_unbox=TRUE)))
+  }
+  fname <- sprintf("raport_%s_%s.json", sensitive_col, target_col)
+  res$setHeader("Content-Disposition", sprintf('attachment; filename="%s"', fname))
+  charToRaw(jsonlite::toJSON(report, auto_unbox=TRUE, pretty=TRUE, na="null"))
+}
+
+#* Export grafice ca arhivă ZIP (PNG per grafic)
+#* @tag Export
+#* @post /export/charts
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana target (numeric sau binary)
+#* @param positive_value Valoarea pozitivă pentru target binar (opțional)
+#* @param group1 Grup 1 (opțional)
+#* @param group2 Grup 2 (opțional)
+#* @serializer contentType list(type="application/zip")
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(charToRaw('{"error":"file_id nu exista"}'))
+  }
+  target_type <- detect_col_type(entry$df[[target_col]])
+  tmp_dir     <- tempfile(); dir.create(tmp_dir)
+  on.exit(unlink(tmp_dir, recursive=TRUE))
+  .write_charts(tmp_dir, file_id, sensitive_col, target_col, positive_value, group1, group2, target_type)
+  all_files <- list.files(tmp_dir, full.names=TRUE)
+  if (length(all_files)==0) {
+    res$status <- 422
+    return(charToRaw('{"error":"Nu s-a putut genera niciun grafic."}'))
+  }
+  zip_path <- tempfile(fileext=".zip")
+  on.exit(unlink(zip_path), add=TRUE)
+  zip(zipfile=zip_path, files=all_files, flags="-j")
+  fname <- sprintf("grafice_%s_%s.zip", sensitive_col, target_col)
+  res$setHeader("Content-Disposition", sprintf('attachment; filename="%s"', fname))
+  readBin(zip_path, "raw", file.info(zip_path)$size)
+}
+
+#* Export complet: raport JSON + grafice PNG într-un singur ZIP
+#* @tag Export
+#* @post /export/full
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana target (numeric sau binary)
+#* @param positive_value Valoarea pozitivă pentru target binar (opțional)
+#* @param group1 Grup 1 pentru comparație pereche (opțional)
+#* @param group2 Grup 2 pentru comparație pereche (opțional)
+#* @serializer contentType list(type="application/zip")
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(charToRaw('{"error":"file_id nu exista"}'))
+  }
+  target_type <- detect_col_type(entry$df[[target_col]])
+  tmp_dir     <- tempfile(); dir.create(tmp_dir)
+  on.exit(unlink(tmp_dir, recursive=TRUE))
+  report   <- .build_report(file_id, sensitive_col, target_col, positive_value, group1, group2)
+  json_str <- jsonlite::toJSON(report, auto_unbox=TRUE, pretty=TRUE, na="null")
+  writeLines(json_str, file.path(tmp_dir, sprintf("raport_%s_%s.json", sensitive_col, target_col)))
+  .write_charts(tmp_dir, file_id, sensitive_col, target_col, positive_value, group1, group2, target_type)
+  zip_path  <- tempfile(fileext=".zip")
+  on.exit(unlink(zip_path), add=TRUE)
+  all_files <- list.files(tmp_dir, full.names=TRUE)
+  zip(zipfile=zip_path, files=all_files, flags="-j")
+  fname <- sprintf("export_complet_%s_%s.zip", sensitive_col, target_col)
+  res$setHeader("Content-Disposition", sprintf('attachment; filename="%s"', fname))
+  readBin(zip_path, "raw", file.info(zip_path)$size)
+}
