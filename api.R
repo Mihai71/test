@@ -1058,3 +1058,269 @@ function(file_id, sensitive_col, target_col,
     thresholds        = list(neglijabil = 0.20, moderat = 0.50)
   )
 }
+# ============================================================
+# GRUP 7 — SOCIO-DEMOGRAFIC
+# ============================================================
+
+# ── Date de referință statice Eurostat (2022-2023) ───────────
+EUROSTAT_REF <- list(
+  pay_gap_pct = list(
+    EU = 12.7, RO = 3.6, DE = 17.6, FR = 15.8, HU = 17.7, BG = 12.3,
+    note = "Gender pay gap neajustat (% diferență câștiguri orare brute, sursa Eurostat 2022)"
+  ),
+  employment_rate_pct = list(
+    EU = 70.4, RO = 62.8, DE = 76.7, FR = 68.1, HU = 74.4, BG = 70.3,
+    note = "Rata de ocupare 15-64 ani, ambele sexe (%, sursa Eurostat 2022)"
+  ),
+  tertiary_education_pct = list(
+    EU = 33.5, RO = 19.6, DE = 33.5, FR = 38.5, HU = 26.3, BG = 30.1,
+    note = "Populație 25-64 ani cu educație terțiară (%, sursa Eurostat 2022)"
+  )
+)
+
+# ── Distribuție regională populație România (INS 2022, %) ─────
+RO_REGION_POP_PCT <- list(
+  "Nord-Est"          = 16.5,
+  "Sud-Est"           = 13.5,
+  "Sud - Muntenia"    = 16.0,
+  "Sud-Vest Oltenia"  = 10.5,
+  "Vest"              =  9.5,
+  "Nord-Vest"         = 13.0,
+  "Centru"            = 12.0,
+  "Bucuresti-Ilfov"   =  9.0
+)
+
+#* Date de referință Eurostat: pay gap, rata ocupare, educație terțiară
+#* @tag Socio-Demografic
+#* @get /socio/reference
+#* @serializer json
+function() {
+  list(
+    source      = "Eurostat / INS România",
+    reference_year = 2022,
+    indicators  = list(
+      pay_gap = list(
+        label = "Gender pay gap neajustat (%)",
+        note  = EUROSTAT_REF$pay_gap_pct$note,
+        values = list(
+          EU = EUROSTAT_REF$pay_gap_pct$EU,
+          RO = EUROSTAT_REF$pay_gap_pct$RO,
+          DE = EUROSTAT_REF$pay_gap_pct$DE,
+          FR = EUROSTAT_REF$pay_gap_pct$FR,
+          HU = EUROSTAT_REF$pay_gap_pct$HU,
+          BG = EUROSTAT_REF$pay_gap_pct$BG
+        )
+      ),
+      employment_rate = list(
+        label = "Rata de ocupare 15-64 ani (%)",
+        note  = EUROSTAT_REF$employment_rate_pct$note,
+        values = list(
+          EU = EUROSTAT_REF$employment_rate_pct$EU,
+          RO = EUROSTAT_REF$employment_rate_pct$RO,
+          DE = EUROSTAT_REF$employment_rate_pct$DE,
+          FR = EUROSTAT_REF$employment_rate_pct$FR,
+          HU = EUROSTAT_REF$employment_rate_pct$HU,
+          BG = EUROSTAT_REF$employment_rate_pct$BG
+        )
+      ),
+      tertiary_education = list(
+        label = "Educație terțiară 25-64 ani (%)",
+        note  = EUROSTAT_REF$tertiary_education_pct$note,
+        values = list(
+          EU = EUROSTAT_REF$tertiary_education_pct$EU,
+          RO = EUROSTAT_REF$tertiary_education_pct$RO,
+          DE = EUROSTAT_REF$tertiary_education_pct$DE,
+          FR = EUROSTAT_REF$tertiary_education_pct$FR,
+          HU = EUROSTAT_REF$tertiary_education_pct$HU,
+          BG = EUROSTAT_REF$tertiary_education_pct$BG
+        )
+      )
+    ),
+    ro_region_population_pct = RO_REGION_POP_PCT
+  )
+}
+
+#* Distribuție pe grupe de vârstă + comparație cu referință EU
+#* @tag Socio-Demografic
+#* @post /socio/age
+#* @param file_id ID-ul fișierului
+#* @param age_col Coloana cu vârsta (numerică)
+#* @serializer json
+function(file_id, age_col, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!age_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", age_col)))
+  }
+  if (!is.numeric(df[[age_col]])) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu este numerică.", age_col)))
+  }
+  
+  ages <- df[[age_col]][!is.na(df[[age_col]])]
+  if (length(ages) < 4) {
+    res$status <- 422
+    return(list(error = "Date insuficiente pentru analiza vârstei (minimum 4 valori)."))
+  }
+  
+  breaks <- c(0, 25, 35, 50, 65, Inf)
+  labels <- c("<=25", "26-35", "36-50", "51-65", "65+")
+  grupe  <- cut(ages, breaks = breaks, labels = labels, right = TRUE)
+  counts <- table(grupe)
+  props  <- counts / length(ages) * 100
+  
+  age_groups <- lapply(labels, function(lb) {
+    list(
+      group      = lb,
+      count      = unname(counts[lb]),
+      percent    = round(unname(props[lb]), 2)
+    )
+  })
+  
+  list(
+    file_id      = file_id,
+    age_col      = age_col,
+    n_valid      = length(ages),
+    mean_age     = round(mean(ages), 2),
+    median_age   = round(median(ages), 2),
+    min_age      = min(ages),
+    max_age      = max(ages),
+    std_age      = round(sd(ages), 2),
+    age_groups   = age_groups,
+    reference    = list(
+      note       = "Vârsta medie forță de muncă RO (INS 2022): ~42 ani",
+      ro_mean_workforce_age = 42
+    )
+  )
+}
+
+#* Distribuție nivel educație + comparație cu referință Eurostat
+#* @tag Socio-Demografic
+#* @post /socio/education
+#* @param file_id ID-ul fișierului
+#* @param education_col Coloana cu nivelul de educație
+#* @serializer json
+function(file_id, education_col, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!education_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", education_col)))
+  }
+  
+  vals    <- df[[education_col]][!is.na(df[[education_col]])]
+  n_total <- length(vals)
+  
+  if (n_total < 4) {
+    res$status <- 422
+    return(list(error = "Date insuficiente pentru analiza educației (minimum 4 valori)."))
+  }
+  
+  counts <- table(as.character(vals))
+  props  <- counts / n_total * 100
+  
+  levels_info <- lapply(names(counts), function(lv) {
+    list(
+      level   = lv,
+      count   = unname(counts[lv]),
+      percent = round(unname(props[lv]), 2)
+    )
+  })
+  
+  # Detectează automat proporția cu educație terțiară (Facultate/Masterat/Doctorat)
+  tertiary_keywords <- c("facultate", "masterat", "doctorat", "universitar",
+                         "bachelor", "master", "phd", "licenta", "licență")
+  tertiary_vals <- vals[tolower(as.character(vals)) %in% tertiary_keywords |
+                          grepl(paste(tertiary_keywords, collapse="|"),
+                                tolower(as.character(vals)))]
+  pct_tertiary <- round(length(tertiary_vals) / n_total * 100, 2)
+  
+  list(
+    file_id          = file_id,
+    education_col    = education_col,
+    n_valid          = n_total,
+    n_levels         = length(counts),
+    levels           = levels_info,
+    pct_tertiary_est = pct_tertiary,
+    reference        = list(
+      note               = "Educație terțiară 25-64 ani (Eurostat 2022)",
+      ro_pct             = EUROSTAT_REF$tertiary_education_pct$RO,
+      eu_pct             = EUROSTAT_REF$tertiary_education_pct$EU,
+      above_ro_reference = pct_tertiary > EUROSTAT_REF$tertiary_education_pct$RO
+    )
+  )
+}
+
+#* Distribuție regională + comparație cu structura populației RO
+#* @tag Socio-Demografic
+#* @post /socio/region
+#* @param file_id ID-ul fișierului
+#* @param region_col Coloana cu regiunea
+#* @serializer json
+function(file_id, region_col, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!region_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", region_col)))
+  }
+  
+  vals    <- df[[region_col]][!is.na(df[[region_col]])]
+  n_total <- length(vals)
+  
+  if (n_total < 4) {
+    res$status <- 422
+    return(list(error = "Date insuficiente pentru analiza regională (minimum 4 valori)."))
+  }
+  
+  counts <- table(as.character(vals))
+  props  <- counts / n_total * 100
+  
+  regions_info <- lapply(names(counts), function(rg) {
+    ref_pct    <- RO_REGION_POP_PCT[[rg]]
+    sample_pct <- round(unname(props[rg]), 2)
+    list(
+      region         = rg,
+      count          = unname(counts[rg]),
+      sample_pct     = sample_pct,
+      reference_pct  = ref_pct,
+      deviation_pp   = if (!is.null(ref_pct)) round(sample_pct - ref_pct, 2) else NULL,
+      undersampled   = if (!is.null(ref_pct)) sample_pct < ref_pct else NULL
+    )
+  })
+  
+  matched <- names(counts)[names(counts) %in% names(RO_REGION_POP_PCT)]
+  
+  list(
+    file_id          = file_id,
+    region_col       = region_col,
+    n_valid          = n_total,
+    n_regions        = length(counts),
+    regions          = regions_info,
+    reference_source = "INS România 2022 — distribuție populație pe regiuni NUTS2",
+    matched_regions  = as.list(matched),
+    note             = if (length(matched) < length(counts))
+      "Unele regiuni din fișier nu au corespondent în datele de referință INS."
+    else
+      "Toate regiunile au corespondent în datele de referință INS."
+  )
+}
