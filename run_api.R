@@ -9,3 +9,4 @@ pr$run(
   docs = TRUE    # Swagger UI disponibil la http://127.0.0.1:8000/__docs__/
 )
 
+

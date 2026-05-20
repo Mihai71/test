@@ -23,7 +23,6 @@ detect_format <- function(filename) {
 }
 
 # ── Helper: citește fișierul indiferent de cum vine din Plumber
-#   (unele versiuni dau $datapath, altele dau $value ca raw bytes)
 read_uploaded_file <- function(file_obj, format) {
   if (!is.null(file_obj$datapath)) {
     path    <- file_obj$datapath
@@ -51,11 +50,9 @@ read_uploaded_file <- function(file_obj, format) {
   df
 }
 
-# ── Helper: transformă dataframe în listă JSON-safe (gestionează NA) ──
+# ── Helper: transformă dataframe în listă JSON-safe ───────────
 df_to_json_safe <- function(df) {
-  jsonlite::fromJSON(
-    jsonlite::toJSON(df, na = "null", auto_unbox = FALSE)
-  )
+  jsonlite::fromJSON(jsonlite::toJSON(df, na = "null", auto_unbox = FALSE))
 }
 
 # ── Keywords pentru detecție automată ────────────────────────
@@ -76,6 +73,11 @@ FINANCIAL_KEYWORDS <- c(
   "indemnizatie", "indemnizație"
 )
 
+POSITIVE_KEYWORDS <- c(
+  "da", "yes", "true", "1", "aprobat", "promovat", "admis",
+  "acceptat", "success", "succes", "pozitiv", "activ", "valid", "ok"
+)
+
 # ── Helper: detectează tipul unei coloane ────────────────────
 detect_col_type <- function(col_values) {
   non_na <- col_values[!is.na(col_values)]
@@ -92,7 +94,18 @@ matches_keywords <- function(col_name, keywords) {
   any(sapply(keywords, function(kw) grepl(kw, col_lower, fixed = TRUE)))
 }
 
-# ── Helper Grup 3: validare și extragere grupuri numerice ─────
+# ── Helper: detectează automat valoarea pozitivă ──────────────
+detect_positive_value <- function(values) {
+  vals_str   <- as.character(values)
+  vals_lower <- tolower(vals_str)
+  for (kw in POSITIVE_KEYWORDS) {
+    match_idx <- which(vals_lower == kw)
+    if (length(match_idx) > 0) return(vals_str[match_idx[1]])
+  }
+  sort(vals_str)[2]
+}
+
+# ── Helper: extrage grupuri numerice din fișier ───────────────
 get_numeric_groups <- function(file_id, sensitive_col, target_col) {
   entry <- file_store[[file_id]]
   if (is.null(entry))
@@ -122,6 +135,112 @@ get_numeric_groups <- function(file_id, sensitive_col, target_col) {
   list(error = NULL, groups = groups, n_groups = length(groups), df_clean = df_clean)
 }
 
+# ── Helper: filtrează la exact 2 grupuri pentru metrici pereche
+filter_two_groups <- function(groups, group1, group2, sensitive_col) {
+  available <- paste(names(groups), collapse = ", ")
+  
+  if (!is.null(group1) && !is.null(group2) &&
+      trimws(group1) != "" && trimws(group2) != "") {
+    if (!group1 %in% names(groups))
+      return(list(error = sprintf(
+        "group1 '%s' nu există. Grupuri disponibile: %s", group1, available)))
+    if (!group2 %in% names(groups))
+      return(list(error = sprintf(
+        "group2 '%s' nu există. Grupuri disponibile: %s", group2, available)))
+    if (group1 == group2)
+      return(list(error = "group1 și group2 trebuie să fie diferite."))
+    return(list(error = NULL, g1 = group1, g2 = group2,
+                groups = groups[c(group1, group2)]))
+  }
+  
+  if (length(groups) != 2)
+    return(list(error = sprintf(
+      "Coloana '%s' are %d grupuri (%s). Specificați 'group1' și 'group2' pentru a selecta 2 grupuri de comparat.",
+      sensitive_col, length(groups), available
+    )))
+  
+  list(error = NULL, g1 = names(groups)[1], g2 = names(groups)[2], groups = groups)
+}
+
+# ── Helper: extrage proporții per grup pentru target binar ────
+get_binary_groups <- function(file_id, sensitive_col, target_col,
+                              positive_value = NULL,
+                              group1 = NULL, group2 = NULL) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry))
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  
+  df <- entry$df
+  
+  if (!sensitive_col %in% colnames(df))
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", sensitive_col)))
+  if (!target_col %in% colnames(df))
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", target_col)))
+  
+  valid_rows <- !is.na(df[[sensitive_col]]) & !is.na(df[[target_col]])
+  df_clean   <- df[valid_rows, ]
+  
+  if (nrow(df_clean) < 4)
+    return(list(error = "Date insuficiente după eliminarea valorilor lipsă (minimum 4 rânduri valide)."))
+  
+  target_vals   <- as.character(df_clean[[target_col]])
+  unique_target <- unique(target_vals)
+  
+  if (length(unique_target) != 2)
+    return(list(error = sprintf(
+      "Coloana '%s' trebuie să fie binară (exact 2 valori unice). Găsite: %d valori (%s).",
+      target_col, length(unique_target), paste(head(unique_target, 5), collapse = ", ")
+    )))
+  
+  if (is.null(positive_value) || trimws(positive_value) == "") {
+    positive_value <- detect_positive_value(unique_target)
+  } else if (!positive_value %in% unique_target) {
+    return(list(error = sprintf(
+      "Valoarea pozitivă '%s' nu există în coloana '%s'. Valori disponibile: %s",
+      positive_value, target_col, paste(unique_target, collapse = ", ")
+    )))
+  }
+  
+  sens_vals    <- as.character(df_clean[[sensitive_col]])
+  all_groups   <- unique(sens_vals)
+  available    <- paste(all_groups, collapse = ", ")
+  
+  if (!is.null(group1) && !is.null(group2) &&
+      trimws(group1) != "" && trimws(group2) != "") {
+    if (!group1 %in% all_groups)
+      return(list(error = sprintf("group1 '%s' nu există. Grupuri disponibile: %s", group1, available)))
+    if (!group2 %in% all_groups)
+      return(list(error = sprintf("group2 '%s' nu există. Grupuri disponibile: %s", group2, available)))
+    if (group1 == group2)
+      return(list(error = "group1 și group2 trebuie să fie diferite."))
+    sel_groups <- c(group1, group2)
+  } else if (length(all_groups) == 2) {
+    sel_groups <- all_groups
+  } else {
+    return(list(error = sprintf(
+      "Coloana '%s' are %d grupuri (%s). Specificați 'group1' și 'group2' pentru a selecta 2 grupuri de comparat.",
+      sensitive_col, length(all_groups), available
+    )))
+  }
+  
+  props <- lapply(sel_groups, function(g) {
+    mask       <- sens_vals == g
+    n_total    <- sum(mask)
+    n_positive <- sum(target_vals[mask] == positive_value)
+    list(group = g, count = n_total, n_positive = n_positive,
+         proportion = n_positive / n_total)
+  })
+  names(props) <- sel_groups
+  
+  p_vals     <- sapply(props, function(x) x$proportion)
+  ord        <- order(p_vals, decreasing = TRUE)
+  privileged <- props[[sel_groups[ord[1]]]]
+  protected  <- props[[sel_groups[ord[2]]]]
+  
+  list(error = NULL, privileged = privileged, protected = protected,
+       positive_value = positive_value, n_groups = length(sel_groups))
+}
+
 # ── Helper: magnitudinea Cohen's d ───────────────────────────
 cohens_d_magnitude <- function(d) {
   d <- abs(d)
@@ -129,6 +248,25 @@ cohens_d_magnitude <- function(d) {
   if (d < 0.5) return("mic")
   if (d < 0.8) return("mediu")
   return("mare")
+}
+
+# ── Helper: eta-squared (η²) pentru 3+ grupuri numerice ──────
+compute_eta_squared <- function(groups) {
+  all_vals   <- unlist(groups)
+  grand_mean <- mean(all_vals)
+  ss_total   <- sum((all_vals - grand_mean)^2)
+  if (ss_total == 0) return(0)
+  ss_between <- sum(sapply(groups, function(g) length(g) * (mean(g) - grand_mean)^2))
+  min(ss_between / ss_total, 1.0)
+}
+
+# ── Helper: skewness calculat manual ─────────────────────────
+compute_skewness <- function(x) {
+  n  <- length(x)
+  mu <- mean(x)
+  s  <- sd(x)
+  if (s == 0 || n < 3) return(0)
+  sum((x - mu)^3) / (n * s^3)
 }
 
 # ============================================================
@@ -314,8 +452,8 @@ function(file_id, res) {
 #* @tag Data Profiling
 #* @post /validate
 #* @param file_id ID-ul fișierului
-#* @param sensitive_col Numele coloanei atribut sensibil (trebuie să fie binary sau categorical)
-#* @param target_col Numele coloanei target (trebuie să fie numeric sau binary)
+#* @param sensitive_col Coloana atribut sensibil (binary sau categorical — inclusiv 3+ grupuri)
+#* @param target_col Coloana target (numeric sau binary)
 #* @serializer json
 function(file_id, sensitive_col, target_col, res) {
   entry <- file_store[[file_id]]
@@ -339,14 +477,13 @@ function(file_id, sensitive_col, target_col, res) {
   
   if (sensitive_col == target_col) {
     res$status <- 400
-    return(list(
-      valid  = FALSE,
-      errors = list("Atributul sensibil și target-ul nu pot fi aceeași coloană.")
-    ))
+    return(list(valid = FALSE,
+                errors = list("Atributul sensibil și target-ul nu pot fi aceeași coloană.")))
   }
   
   sensitive_type <- detect_col_type(df[[sensitive_col]])
   target_type    <- detect_col_type(df[[target_col]])
+  n_sens_groups  <- length(unique(df[[sensitive_col]][!is.na(df[[sensitive_col]])]))
   
   if (!sensitive_type %in% c("binary", "categorical"))
     errors <- c(errors, sprintf(
@@ -363,8 +500,12 @@ function(file_id, sensitive_col, target_col, res) {
     valid          = length(errors) == 0,
     sensitive_col  = sensitive_col,
     sensitive_type = sensitive_type,
+    n_sens_groups  = n_sens_groups,
     target_col     = target_col,
     target_type    = target_type,
+    note           = if (n_sens_groups > 2)
+      "Atribut cu 3+ grupuri: pentru metrici pereche specificați 'group1' și 'group2'."
+    else NULL,
     errors         = as.list(errors)
   )
 }
@@ -373,12 +514,12 @@ function(file_id, sensitive_col, target_col, res) {
 # GRUP 3 — METRICI PENTRU TARGET NUMERIC
 # ============================================================
 
-#* Statistici descriptive per grup (medie, mediană, deviație standard)
+#* Statistici descriptive per grup — funcționează cu orice număr de grupuri
 #* @tag Metrici Numerice
 #* @post /metrics/descriptive
 #* @param file_id ID-ul fișierului
-#* @param sensitive_col Coloana atribut sensibil (ex: sex, regiune)
-#* @param target_col Coloana numerică analizată (ex: salariu)
+#* @param sensitive_col Coloana atribut sensibil (orice număr de grupuri)
+#* @param target_col Coloana numerică analizată
 #* @serializer json
 function(file_id, sensitive_col, target_col, res) {
   r <- get_numeric_groups(file_id, sensitive_col, target_col)
@@ -410,31 +551,27 @@ function(file_id, sensitive_col, target_col, res) {
 #* @tag Metrici Numerice
 #* @post /metrics/mean-diff
 #* @param file_id ID-ul fișierului
-#* @param sensitive_col Coloana atribut sensibil (exact 2 grupuri)
+#* @param sensitive_col Coloana atribut sensibil
 #* @param target_col Coloana numerică analizată
+#* @param group1 Primul grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @param group2 Al doilea grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
 #* @serializer json
-function(file_id, sensitive_col, target_col, res) {
+function(file_id, sensitive_col, target_col, group1 = NULL, group2 = NULL, res) {
   r <- get_numeric_groups(file_id, sensitive_col, target_col)
   if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
   
-  if (r$n_groups != 2) {
-    res$status <- 400
-    return(list(error = sprintf(
-      "Această metrică necesită exact 2 grupuri. Coloana '%s' are %d grupuri. Folosiți /metrics/anova pentru mai multe grupuri.",
-      sensitive_col, r$n_groups
-    )))
-  }
+  f <- filter_two_groups(r$groups, group1, group2, sensitive_col)
+  if (!is.null(f$error)) { res$status <- 400; return(list(error = f$error)) }
   
-  g  <- names(r$groups)
-  m1 <- mean(r$groups[[g[1]]])
-  m2 <- mean(r$groups[[g[2]]])
+  m1 <- mean(f$groups[[f$g1]])
+  m2 <- mean(f$groups[[f$g2]])
   
   list(
     file_id       = file_id,
     sensitive_col = sensitive_col,
     target_col    = target_col,
-    group1        = g[1],
-    group2        = g[2],
+    group1        = f$g1,
+    group2        = f$g2,
     mean1         = round(m1, 4),
     mean2         = round(m2, 4),
     abs_diff      = round(m1 - m2, 4),
@@ -446,23 +583,19 @@ function(file_id, sensitive_col, target_col, res) {
 #* @tag Metrici Numerice
 #* @post /metrics/cohens-d
 #* @param file_id ID-ul fișierului
-#* @param sensitive_col Coloana atribut sensibil (exact 2 grupuri)
+#* @param sensitive_col Coloana atribut sensibil
 #* @param target_col Coloana numerică analizată
+#* @param group1 Primul grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @param group2 Al doilea grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
 #* @serializer json
-function(file_id, sensitive_col, target_col, res) {
+function(file_id, sensitive_col, target_col, group1 = NULL, group2 = NULL, res) {
   r <- get_numeric_groups(file_id, sensitive_col, target_col)
   if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
   
-  if (r$n_groups != 2) {
-    res$status <- 400
-    return(list(error = sprintf(
-      "Cohen's d necesită exact 2 grupuri. Coloana '%s' are %d grupuri.",
-      sensitive_col, r$n_groups
-    )))
-  }
+  f <- filter_two_groups(r$groups, group1, group2, sensitive_col)
+  if (!is.null(f$error)) { res$status <- 400; return(list(error = f$error)) }
   
-  g  <- names(r$groups)
-  x1 <- r$groups[[g[1]]]; x2 <- r$groups[[g[2]]]
+  x1 <- f$groups[[f$g1]]; x2 <- f$groups[[f$g2]]
   n1 <- length(x1);       n2 <- length(x2)
   
   sd_pooled <- sqrt(((n1 - 1) * var(x1) + (n2 - 1) * var(x2)) / (n1 + n2 - 2))
@@ -472,8 +605,8 @@ function(file_id, sensitive_col, target_col, res) {
     file_id       = file_id,
     sensitive_col = sensitive_col,
     target_col    = target_col,
-    group1        = g[1],
-    group2        = g[2],
+    group1        = f$g1,
+    group2        = f$g2,
     cohens_d      = round(d, 4),
     cohens_d_abs  = round(abs(d), 4),
     magnitude     = cohens_d_magnitude(d),
@@ -482,34 +615,30 @@ function(file_id, sensitive_col, target_col, res) {
   )
 }
 
-#* Welch t-test — t-statistic și p-value pentru 2 grupuri
+#* Welch t-test — t-statistic și p-value între două grupuri
 #* @tag Metrici Numerice
 #* @post /metrics/welch-ttest
 #* @param file_id ID-ul fișierului
-#* @param sensitive_col Coloana atribut sensibil (exact 2 grupuri)
+#* @param sensitive_col Coloana atribut sensibil
 #* @param target_col Coloana numerică analizată
+#* @param group1 Primul grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @param group2 Al doilea grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
 #* @serializer json
-function(file_id, sensitive_col, target_col, res) {
+function(file_id, sensitive_col, target_col, group1 = NULL, group2 = NULL, res) {
   r <- get_numeric_groups(file_id, sensitive_col, target_col)
   if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
   
-  if (r$n_groups != 2) {
-    res$status <- 400
-    return(list(error = sprintf(
-      "Welch t-test necesită exact 2 grupuri. Coloana '%s' are %d grupuri. Folosiți /metrics/anova.",
-      sensitive_col, r$n_groups
-    )))
-  }
+  f <- filter_two_groups(r$groups, group1, group2, sensitive_col)
+  if (!is.null(f$error)) { res$status <- 400; return(list(error = f$error)) }
   
-  g  <- names(r$groups)
-  tt <- t.test(r$groups[[g[1]]], r$groups[[g[2]]], var.equal = FALSE)
+  tt <- t.test(f$groups[[f$g1]], f$groups[[f$g2]], var.equal = FALSE)
   
   list(
     file_id             = file_id,
     sensitive_col       = sensitive_col,
     target_col          = target_col,
-    group1              = g[1],
-    group2              = g[2],
+    group1              = f$g1,
+    group2              = f$g2,
     t_statistic         = round(unname(tt$statistic), 4),
     p_value             = round(tt$p.value, 6),
     degrees_of_freedom  = round(unname(tt$parameter), 2),
@@ -522,11 +651,11 @@ function(file_id, sensitive_col, target_col, res) {
   )
 }
 
-#* ANOVA Welch — F-statistic și p-value pentru 3 sau mai multe grupuri
+#* ANOVA Welch — F-statistic și p-value pentru orice număr de grupuri
 #* @tag Metrici Numerice
 #* @post /metrics/anova
 #* @param file_id ID-ul fișierului
-#* @param sensitive_col Coloana atribut sensibil (minim 2 grupuri)
+#* @param sensitive_col Coloana atribut sensibil (orice număr de grupuri)
 #* @param target_col Coloana numerică analizată
 #* @serializer json
 function(file_id, sensitive_col, target_col, res) {
@@ -557,5 +686,375 @@ function(file_id, sensitive_col, target_col, res) {
     significant    = anova_res$p.value < 0.05,
     alpha          = 0.05,
     method         = "Welch one-way ANOVA (variante neegale)"
+  )
+}
+
+# ============================================================
+# GRUP 4 — METRICI PENTRU TARGET BINAR
+# ============================================================
+
+#* Statistical Parity Difference — diferența proporțiilor între două grupuri
+#* @tag Metrici Binare
+#* @post /metrics/spd
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana binară analizată
+#* @param positive_value Valoarea considerată succes (opțional, detectată automat)
+#* @param group1 Primul grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @param group2 Al doilea grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @serializer json
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  r <- get_binary_groups(file_id, sensitive_col, target_col,
+                         positive_value, group1, group2)
+  if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+  
+  spd <- r$privileged$proportion - r$protected$proportion
+  
+  list(
+    file_id          = file_id,
+    sensitive_col    = sensitive_col,
+    target_col       = target_col,
+    positive_value   = r$positive_value,
+    group_privileged = list(
+      name       = r$privileged$group,
+      count      = r$privileged$count,
+      n_positive = r$privileged$n_positive,
+      proportion = round(r$privileged$proportion, 4)
+    ),
+    group_protected  = list(
+      name       = r$protected$group,
+      count      = r$protected$count,
+      n_positive = r$protected$n_positive,
+      proportion = round(r$protected$proportion, 4)
+    ),
+    spd            = round(spd, 4),
+    spd_pct        = round(spd * 100, 2),
+    equitable      = abs(spd) < 0.1,
+    interpretation = if (abs(spd) < 0.1) "echitabil"
+    else if (spd > 0) "grupul protejat are rata de succes mai mică"
+    else "grupul protejat are rata de succes mai mare"
+  )
+}
+
+#* Disparate Impact — raportul proporțiilor între două grupuri (regula 80%)
+#* @tag Metrici Binare
+#* @post /metrics/disparate-impact
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana binară analizată
+#* @param positive_value Valoarea considerată succes (opțional, detectată automat)
+#* @param group1 Primul grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @param group2 Al doilea grup de comparat (obligatoriu dacă sensitive_col are 3+ grupuri)
+#* @serializer json
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  r <- get_binary_groups(file_id, sensitive_col, target_col,
+                         positive_value, group1, group2)
+  if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+  
+  p_priv <- r$privileged$proportion
+  p_prot <- r$protected$proportion
+  
+  if (p_priv == 0) {
+    res$status <- 422
+    return(list(error = "Grupul privilegiat are proporție 0 — Disparate Impact nu poate fi calculat."))
+  }
+  
+  di <- p_prot / p_priv
+  
+  list(
+    file_id          = file_id,
+    sensitive_col    = sensitive_col,
+    target_col       = target_col,
+    positive_value   = r$positive_value,
+    group_privileged = list(
+      name       = r$privileged$group,
+      count      = r$privileged$count,
+      proportion = round(p_priv, 4)
+    ),
+    group_protected  = list(
+      name       = r$protected$group,
+      count      = r$protected$count,
+      proportion = round(p_prot, 4)
+    ),
+    disparate_impact = round(di, 4),
+    risk_ratio       = round(di, 4),
+    interpretation   = if (di >= 0.8 && di <= 1.25) "echitabil"
+    else if (di < 0.8) "risc de discriminare"
+    else "favorizare inversă",
+    equitable        = di >= 0.8 && di <= 1.25,
+    rule_80_pct      = list(lower = 0.8, upper = 1.25)
+  )
+}
+
+# ============================================================
+# GRUP 5 — ALERTE DE CALITATE DATE
+# ============================================================
+
+#* Analiză distribuție target: skewness și outlieri IQR
+#* @tag Alerte Calitate
+#* @post /alerts/distribution
+#* @param file_id ID-ul fișierului
+#* @param target_col Coloana numerică analizată
+#* @serializer json
+function(file_id, target_col, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!target_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", target_col)))
+  }
+  if (!is.numeric(df[[target_col]])) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu este numerică.", target_col)))
+  }
+  
+  x <- df[[target_col]][!is.na(df[[target_col]])]
+  
+  if (length(x) < 4) {
+    res$status <- 422
+    return(list(error = "Date insuficiente pentru analiză distribuție (minimum 4 valori non-NA)."))
+  }
+  
+  skew       <- compute_skewness(x)
+  skew_level <- if (abs(skew) <= 0.5) "simetrica"
+  else if (abs(skew) <= 1) "asimetrie_moderata"
+  else "asimetrie_puternica"
+  
+  q1            <- unname(quantile(x, 0.25))
+  q3            <- unname(quantile(x, 0.75))
+  iqr           <- q3 - q1
+  lower_fence   <- q1 - 1.5 * iqr
+  upper_fence   <- q3 + 1.5 * iqr
+  outlier_count <- sum(x < lower_fence | x > upper_fence)
+  outlier_pct   <- outlier_count / length(x) * 100
+  
+  list(
+    file_id          = file_id,
+    target_col       = target_col,
+    n_values         = length(x),
+    skewness         = round(skew, 4),
+    skew_level       = skew_level,
+    q1               = round(q1, 4),
+    q3               = round(q3, 4),
+    iqr              = round(iqr, 4),
+    lower_fence      = round(lower_fence, 4),
+    upper_fence      = round(upper_fence, 4),
+    outlier_count    = outlier_count,
+    outlier_pct      = round(outlier_pct, 2),
+    outlier_severity = if (outlier_pct > 10) "critica"
+    else if (outlier_pct > 5) "atentie"
+    else "ok",
+    thresholds = list(skew_moderat = 0.5, skew_puternic = 1.0,
+                      outlier_atentie = 5.0, outlier_critica = 10.0)
+  )
+}
+
+#* Dezechilibru distribuțional — detectează grupuri sub-reprezentate
+#* @tag Alerte Calitate
+#* @post /alerts/imbalance
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil (orice număr de grupuri)
+#* @serializer json
+function(file_id, sensitive_col, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!sensitive_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", sensitive_col)))
+  }
+  
+  vals    <- df[[sensitive_col]][!is.na(df[[sensitive_col]])]
+  n_total <- length(vals)
+  
+  if (n_total < 4) {
+    res$status <- 422
+    return(list(error = "Date insuficiente pentru analiză dezechilibru (minimum 4 valori non-NA)."))
+  }
+  
+  counts  <- table(vals)
+  props   <- counts / n_total
+  min_idx <- which.min(props)
+  min_prop <- unname(props[min_idx])
+  
+  groups_info <- lapply(names(counts), function(g) {
+    list(group      = g,
+         count      = unname(counts[g]),
+         proportion = round(unname(props[g]), 4),
+         alert      = unname(props[g]) < 0.20)
+  })
+  
+  list(
+    file_id        = file_id,
+    sensitive_col  = sensitive_col,
+    n_total        = n_total,
+    n_groups       = length(counts),
+    groups         = groups_info,
+    min_group      = names(props)[min_idx],
+    min_proportion = round(min_prop, 4),
+    imbalanced     = min_prop < 0.20,
+    severity       = if (min_prop < 0.20) "critica" else "ok",
+    threshold      = 0.20
+  )
+}
+
+#* Raport valori lipsă per coloană
+#* @tag Alerte Calitate
+#* @get /alerts/missing/<file_id>
+#* @serializer json
+function(file_id, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df     <- entry$df
+  n_rows <- nrow(df)
+  
+  columns <- lapply(colnames(df), function(col_name) {
+    n_missing <- sum(is.na(df[[col_name]]))
+    pct       <- n_missing / n_rows
+    list(column        = col_name,
+         missing_count = n_missing,
+         missing_pct   = round(pct * 100, 2),
+         severity      = if (pct > 0.20) "critica"
+         else if (pct > 0.05) "atentie"
+         else "ok")
+  })
+  
+  list(
+    file_id     = file_id,
+    filename    = entry$filename,
+    n_rows      = n_rows,
+    n_cols      = ncol(df),
+    has_missing = any(sapply(columns, function(c) c$missing_count > 0)),
+    columns     = columns,
+    thresholds  = list(atentie = 5.0, critica = 20.0)
+  )
+}
+
+# ============================================================
+# GRUP 6 — BIAS SCORE
+# ============================================================
+
+#* Scor compus de bias: 0.7 × effect_norm + 0.3 × imbalance_penalty
+#* Pentru 2 grupuri: effect_norm = Cohen's d (numeric) sau SPD (binar)
+#* Pentru 3+ grupuri: effect_norm = eta-squared din ANOVA (numeric)
+#*                    sau SPD între group1/group2 specificați (binar)
+#* @tag Bias Score
+#* @post /bias-score
+#* @param file_id ID-ul fișierului
+#* @param sensitive_col Coloana atribut sensibil
+#* @param target_col Coloana target (numeric sau binary)
+#* @param positive_value Valoarea pozitivă pentru target binar (opțional)
+#* @param group1 Grup de referință — doar pentru target binar cu 3+ grupuri
+#* @param group2 Grup protejat — doar pentru target binar cu 3+ grupuri
+#* @serializer json
+function(file_id, sensitive_col, target_col,
+         positive_value = NULL, group1 = NULL, group2 = NULL, res) {
+  entry <- file_store[[file_id]]
+  if (is.null(entry)) {
+    res$status <- 404
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
+  }
+  
+  df <- entry$df
+  
+  if (!sensitive_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", sensitive_col)))
+  }
+  if (!target_col %in% colnames(df)) {
+    res$status <- 400
+    return(list(error = sprintf("Coloana '%s' nu există în fișier.", target_col)))
+  }
+  
+  target_type <- detect_col_type(df[[target_col]])
+  
+  # ── Componenta 1: effect_norm ─────────────────────────────
+  if (target_type == "numeric") {
+    r <- get_numeric_groups(file_id, sensitive_col, target_col)
+    if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+    
+    use_pairwise <- (!is.null(group1) && !is.null(group2) &&
+                       trimws(group1) != "" && trimws(group2) != "") ||
+      r$n_groups == 2
+    
+    if (use_pairwise) {
+      f <- filter_two_groups(r$groups, group1, group2, sensitive_col)
+      if (!is.null(f$error)) { res$status <- 400; return(list(error = f$error)) }
+      x1 <- f$groups[[f$g1]]; x2 <- f$groups[[f$g2]]
+      n1 <- length(x1);       n2 <- length(x2)
+      sd_pooled    <- sqrt(((n1-1)*var(x1) + (n2-1)*var(x2)) / (n1+n2-2))
+      cohens_d     <- if (sd_pooled == 0) 0 else (mean(x1) - mean(x2)) / sd_pooled
+      effect_norm  <- min(abs(cohens_d), 1.0)
+      effect_label <- "Cohen's d"
+      effect_value <- round(cohens_d, 4)
+    } else {
+      eta2         <- compute_eta_squared(r$groups)
+      effect_norm  <- eta2
+      effect_label <- "eta-squared (η²) — toate grupurile"
+      effect_value <- round(eta2, 4)
+    }
+    
+  } else if (target_type == "binary") {
+    r <- get_binary_groups(file_id, sensitive_col, target_col,
+                           positive_value, group1, group2)
+    if (!is.null(r$error)) { res$status <- 400; return(list(error = r$error)) }
+    
+    spd          <- r$privileged$proportion - r$protected$proportion
+    effect_norm  <- min(abs(spd), 1.0)
+    effect_label <- "SPD"
+    effect_value <- round(spd, 4)
+    
+  } else {
+    res$status <- 400
+    return(list(error = sprintf(
+      "Coloana '%s' este de tip '%s'. Target-ul trebuie să fie numeric sau binary.",
+      target_col, target_type
+    )))
+  }
+  
+  # ── Componenta 2: imbalance_penalty ──────────────────────
+  vals              <- df[[sensitive_col]][!is.na(df[[sensitive_col]])]
+  props             <- table(vals) / length(vals)
+  min_prop          <- unname(min(props))
+  imbalance_penalty <- if (min_prop >= 0.20) 0
+  else (0.20 - min_prop) / 0.20
+  
+  # ── Scor final ───────────────────────────────────────────
+  bias_score <- min(0.7 * effect_norm + 0.3 * imbalance_penalty, 1.0)
+  severity   <- if (bias_score < 0.20) "neglijabil"
+  else if (bias_score < 0.50) "moderat"
+  else "ridicat"
+  
+  list(
+    file_id           = file_id,
+    sensitive_col     = sensitive_col,
+    target_col        = target_col,
+    target_type       = target_type,
+    effect_metric     = effect_label,
+    effect_value      = effect_value,
+    effect_norm       = round(effect_norm, 4),
+    min_group_prop    = round(min_prop, 4),
+    imbalance_penalty = round(imbalance_penalty, 4),
+    bias_score        = round(bias_score, 4),
+    severity          = severity,
+    formula           = "min(0.7 * effect_norm + 0.3 * imbalance_penalty, 1.0)",
+    thresholds        = list(neglijabil = 0.20, moderat = 0.50)
   )
 }
