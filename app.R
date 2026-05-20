@@ -1,7 +1,7 @@
 # app.R - Dashboard Interactiv pentru Detectarea Disparităților
 # Arhitectură: R Shiny (UI + server reactiv) + Python via reticulate (procesare date)
 # Cerințe implementate: FR-01 .. FR-07
-
+# reticulate::use_python("C:/Users/pelle/AppData/Local/Programs/Python/Python312/python.exe", required = TRUE)
 library(shiny)
 library(shinydashboard)
 library(DT)
