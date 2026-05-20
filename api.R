@@ -37,7 +37,6 @@ read_uploaded_file <- function(file_obj, format) {
   
   df <- tryCatch({
     if (format == "csv") {
-      # Încearcă UTF-8 mai întâi, apoi Latin-1 (pentru diacritice românești)
       tryCatch(
         read.csv(path, stringsAsFactors = FALSE, encoding  = "UTF-8"),
         error = function(e)
@@ -58,6 +57,7 @@ df_to_json_safe <- function(df) {
     jsonlite::toJSON(df, na = "null", auto_unbox = FALSE)
   )
 }
+
 # ── Keywords pentru detecție automată ────────────────────────
 SENSITIVE_KEYWORDS <- c(
   "gen", "sex", "gender", "varsta", "vârsta", "vîrsta", "age",
@@ -91,6 +91,7 @@ matches_keywords <- function(col_name, keywords) {
   col_lower <- tolower(col_name)
   any(sapply(keywords, function(kw) grepl(kw, col_lower, fixed = TRUE)))
 }
+
 # ── Helper Grup 3: validare și extragere grupuri numerice ─────
 get_numeric_groups <- function(file_id, sensitive_col, target_col) {
   entry <- file_store[[file_id]]
@@ -129,8 +130,9 @@ cohens_d_magnitude <- function(d) {
   if (d < 0.8) return("mediu")
   return("mare")
 }
+
 # ============================================================
-# METADATA API (apare în Swagger UI)
+# METADATA API
 # ============================================================
 
 #* @apiTitle Detectarea Disparităților Socio-Economice
@@ -138,7 +140,7 @@ cohens_d_magnitude <- function(d) {
 #* @apiVersion 1.0.0
 
 # ============================================================
-# FILTER CORS — necesar ca Swagger UI să poată face request-uri
+# FILTER CORS
 # ============================================================
 
 #* @filter cors
@@ -158,6 +160,7 @@ function(req, res) {
 # ============================================================
 
 #* Încarcă un fișier CSV sau Excel și returnează un file_id
+#* @tag File Management
 #* @post /upload
 #* @parser multi
 #* @param file:file Fișierul de încărcat (.csv, .xlsx sau .xls)
@@ -167,9 +170,7 @@ function(req, res) {
   
   if (is.null(file_obj)) {
     res$status <- 400
-    return(list(
-      error = "Câmpul 'file' lipsește. Trimite fișierul ca multipart/form-data."
-    ))
+    return(list(error = "Câmpul 'file' lipsește. Trimite fișierul ca multipart/form-data."))
   }
   
   filename <- file_obj$filename
@@ -191,9 +192,7 @@ function(req, res) {
   
   if (is.null(df)) {
     res$status <- 422
-    return(list(
-      error = "Fișierul nu a putut fi citit. Verificați că nu este corupt."
-    ))
+    return(list(error = "Fișierul nu a putut fi citit. Verificați că nu este corupt."))
   }
   if (nrow(df) == 0) {
     res$status <- 422
@@ -223,6 +222,7 @@ function(req, res) {
 }
 
 #* Previzualizare primele N rânduri dintr-un fișier încărcat
+#* @tag File Management
 #* @get /files/<file_id>/preview
 #* @param n:int Număr de rânduri (1-100, default 5)
 #* @serializer json
@@ -230,9 +230,7 @@ function(file_id, n = 5, res) {
   entry <- file_store[[file_id]]
   if (is.null(entry)) {
     res$status <- 404
-    return(list(
-      error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)
-    ))
+    return(list(error = sprintf("file_id '%s' nu există sau sesiunea a expirat.", file_id)))
   }
   
   n          <- max(1L, min(as.integer(n), 100L))
@@ -250,6 +248,7 @@ function(file_id, n = 5, res) {
 }
 
 #* Șterge un fișier din memorie
+#* @tag File Management
 #* @delete /files/<file_id>
 #* @serializer json
 function(file_id, res) {
@@ -263,15 +262,17 @@ function(file_id, res) {
   rm(list = file_id, envir = file_store)
   
   list(
-    success  = TRUE,
-    message  = sprintf("Fișierul '%s' (id: %s) a fost șters din memorie.", filename, file_id)
+    success = TRUE,
+    message = sprintf("Fișierul '%s' (id: %s) a fost șters din memorie.", filename, file_id)
   )
 }
+
 # ============================================================
 # GRUP 2 — DATA PROFILING
 # ============================================================
 
 #* Profilează toate coloanele unui fișier încărcat
+#* @tag Data Profiling
 #* @post /profile
 #* @param file_id ID-ul fișierului returnat de /upload
 #* @serializer json
@@ -284,8 +285,8 @@ function(file_id, res) {
   
   df      <- entry$df
   columns <- lapply(colnames(df), function(col_name) {
-    col_values <- df[[col_name]]
-    non_na     <- col_values[!is.na(col_values)]
+    col_values  <- df[[col_name]]
+    non_na      <- col_values[!is.na(col_values)]
     unique_vals <- unique(non_na)
     
     list(
@@ -310,6 +311,7 @@ function(file_id, res) {
 }
 
 #* Validează atributele selectate pentru analiză
+#* @tag Data Profiling
 #* @post /validate
 #* @param file_id ID-ul fișierului
 #* @param sensitive_col Numele coloanei atribut sensibil (trebuie să fie binary sau categorical)
@@ -325,12 +327,10 @@ function(file_id, sensitive_col, target_col, res) {
   df     <- entry$df
   errors <- character(0)
   
-  if (!sensitive_col %in% colnames(df)) {
+  if (!sensitive_col %in% colnames(df))
     errors <- c(errors, sprintf("Coloana '%s' nu există în fișier.", sensitive_col))
-  }
-  if (!target_col %in% colnames(df)) {
+  if (!target_col %in% colnames(df))
     errors <- c(errors, sprintf("Coloana '%s' nu există în fișier.", target_col))
-  }
   
   if (length(errors) > 0) {
     res$status <- 400
@@ -348,18 +348,16 @@ function(file_id, sensitive_col, target_col, res) {
   sensitive_type <- detect_col_type(df[[sensitive_col]])
   target_type    <- detect_col_type(df[[target_col]])
   
-  if (!sensitive_type %in% c("binary", "categorical")) {
+  if (!sensitive_type %in% c("binary", "categorical"))
     errors <- c(errors, sprintf(
       "Coloana '%s' este '%s'. Atributul sensibil trebuie să fie 'binary' sau 'categorical'.",
       sensitive_col, sensitive_type
     ))
-  }
-  if (!target_type %in% c("numeric", "binary")) {
+  if (!target_type %in% c("numeric", "binary"))
     errors <- c(errors, sprintf(
       "Coloana '%s' este '%s'. Target-ul trebuie să fie 'numeric' sau 'binary'.",
       target_col, target_type
     ))
-  }
   
   list(
     valid          = length(errors) == 0,
@@ -370,11 +368,13 @@ function(file_id, sensitive_col, target_col, res) {
     errors         = as.list(errors)
   )
 }
+
 # ============================================================
 # GRUP 3 — METRICI PENTRU TARGET NUMERIC
 # ============================================================
 
 #* Statistici descriptive per grup (medie, mediană, deviație standard)
+#* @tag Metrici Numerice
 #* @post /metrics/descriptive
 #* @param file_id ID-ul fișierului
 #* @param sensitive_col Coloana atribut sensibil (ex: sex, regiune)
@@ -407,6 +407,7 @@ function(file_id, sensitive_col, target_col, res) {
 }
 
 #* Diferența mediilor între două grupuri (absolută și procentuală)
+#* @tag Metrici Numerice
 #* @post /metrics/mean-diff
 #* @param file_id ID-ul fișierului
 #* @param sensitive_col Coloana atribut sensibil (exact 2 grupuri)
@@ -424,7 +425,7 @@ function(file_id, sensitive_col, target_col, res) {
     )))
   }
   
-  g <- names(r$groups)
+  g  <- names(r$groups)
   m1 <- mean(r$groups[[g[1]]])
   m2 <- mean(r$groups[[g[2]]])
   
@@ -442,6 +443,7 @@ function(file_id, sensitive_col, target_col, res) {
 }
 
 #* Cohen's d — mărimea efectului standardizată între două grupuri
+#* @tag Metrici Numerice
 #* @post /metrics/cohens-d
 #* @param file_id ID-ul fișierului
 #* @param sensitive_col Coloana atribut sensibil (exact 2 grupuri)
@@ -481,6 +483,7 @@ function(file_id, sensitive_col, target_col, res) {
 }
 
 #* Welch t-test — t-statistic și p-value pentru 2 grupuri
+#* @tag Metrici Numerice
 #* @post /metrics/welch-ttest
 #* @param file_id ID-ul fișierului
 #* @param sensitive_col Coloana atribut sensibil (exact 2 grupuri)
@@ -502,16 +505,16 @@ function(file_id, sensitive_col, target_col, res) {
   tt <- t.test(r$groups[[g[1]]], r$groups[[g[2]]], var.equal = FALSE)
   
   list(
-    file_id            = file_id,
-    sensitive_col      = sensitive_col,
-    target_col         = target_col,
-    group1             = g[1],
-    group2             = g[2],
-    t_statistic        = round(unname(tt$statistic), 4),
-    p_value            = round(tt$p.value, 6),
-    degrees_of_freedom = round(unname(tt$parameter), 2),
-    significant        = tt$p.value < 0.05,
-    alpha              = 0.05,
+    file_id             = file_id,
+    sensitive_col       = sensitive_col,
+    target_col          = target_col,
+    group1              = g[1],
+    group2              = g[2],
+    t_statistic         = round(unname(tt$statistic), 4),
+    p_value             = round(tt$p.value, 6),
+    degrees_of_freedom  = round(unname(tt$parameter), 2),
+    significant         = tt$p.value < 0.05,
+    alpha               = 0.05,
     confidence_interval = list(
       lower = round(tt$conf.int[1], 4),
       upper = round(tt$conf.int[2], 4)
@@ -520,6 +523,7 @@ function(file_id, sensitive_col, target_col, res) {
 }
 
 #* ANOVA Welch — F-statistic și p-value pentru 3 sau mai multe grupuri
+#* @tag Metrici Numerice
 #* @post /metrics/anova
 #* @param file_id ID-ul fișierului
 #* @param sensitive_col Coloana atribut sensibil (minim 2 grupuri)
