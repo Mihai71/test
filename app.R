@@ -703,7 +703,7 @@ server <- function(input, output, session) {
           icon("info-circle"), " ",
           tags$b("Notă metodologică:"), tags$br(),
           "Valorile de referință sunt exprimate în RON, convertite din EUR",
-          " la cursul de 1 EUR = 5,2 RON (mai 2024).", tags$br(),
+          " la cursul de 1 EUR = 5,2 RON (mai 2026).", tags$br(),
           "România: salariu mediu ", tags$b("net"), " (sursa INS 2023).", tags$br(),
           "UE/DE/FR/HU/BG: salariu mediu ", tags$b("brut"), " (sursa Eurostat 2023).", tags$br(),
           "Comparația net vs. brut este orientativă."

@@ -1,4 +1,4 @@
-Feature: Testare completă API — Detectarea Disparităților Socio-Economice
+Feature: Testare completă API pentru Detectarea Disparităților Socio-Economice
 
   Background:
     * url 'http://127.0.0.1:8000'
