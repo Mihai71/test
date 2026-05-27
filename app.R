@@ -156,6 +156,10 @@ ui <- dashboardPage(
                                        label    = "Selectează coloana de filtrare:",
                                        choices  = c("(fără filtru)" = ""),
                                        width    = "100%"),
+                           actionButton("reset_filter",
+                                        label = tagList(icon("times"), " Resetează filtrul"),
+                                        class = "btn-xs btn-default",
+                                        style = "margin-bottom:6px;"),
                            uiOutput("ui_filter_value")
                     ),
                     
@@ -532,6 +536,9 @@ server <- function(input, output, session) {
       tagList(icon("check-circle"), " Modificările au fost salvate!"),
       type = "message", duration = 3
     )
+  })
+  observeEvent(input$reset_filter, {
+    updateSelectInput(session, "filter_col", selected = "")
   })
   
   # -------------------------------------------------------------------------
