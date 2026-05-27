@@ -112,7 +112,19 @@ ui <- dashboardPage(
         .preproc-sep   { border-top:1px solid #eee; margin:8px 0; }
       "))
     ),
-    
+    tags$script(HTML("
+      function toggleRow(el, rowid) {
+        var tr = el.closest('tr');
+        if (el.checked) {
+          tr.style.opacity = '1';
+          tr.style.background = '';
+        } else {
+          tr.style.opacity = '0.45';
+          tr.style.background = '#fff8e1';
+        }
+        Shiny.setInputValue('toggle_row', {rowid: rowid, val: el.checked}, {priority: 'event'});
+      }
+    ")),
     tabItems(
       
       # -----------------------------------------------------------------------
@@ -400,6 +412,10 @@ server <- function(input, output, session) {
       if (is.character(x)) x[trimws(x) == ""] <- NA
       x
     })
+    df <- cbind(
+      data.frame(.included = rep(TRUE, nrow(df)), .row_id = seq_len(nrow(df))),
+      df
+    )
     data_working(df)
   }, ignoreNULL = TRUE)
   
@@ -417,23 +433,25 @@ server <- function(input, output, session) {
     
     # 1. Elimină rânduri cu NA
     if (isTRUE(input$remove_na)) {
-      keep_rows <- keep_rows[complete.cases(df[keep_rows, , drop = FALSE])]
+      df_chk <- df[keep_rows, !names(df) %in% c(".row_id", ".included"), drop = FALSE]
+      keep_rows <- keep_rows[complete.cases(df_chk)]
     }
     
     # 2. Elimină duplicate
     if (isTRUE(input$remove_duplicates)) {
-      keep_rows <- keep_rows[!duplicated(df[keep_rows, , drop = FALSE])]
+      df_chk <- df[keep_rows, !names(df) %in% c(".row_id", ".included"), drop = FALSE]
+      keep_rows <- keep_rows[!duplicated(df_chk)]
     }
     
     # 3. Filtrare coloană / valoare / specială
     fc <- if (!is.null(input$filter_col)) input$filter_col else ""
     
     if (fc == "__missing__") {
-      df_sub <- df[keep_rows, , drop = FALSE]
+      df_sub <- df[keep_rows, !names(df) %in% c(".row_id", ".included"), drop = FALSE]
       keep_rows <- keep_rows[!complete.cases(df_sub)]
       
     } else if (fc == "__duplicates__") {
-      df_sub <- df[keep_rows, , drop = FALSE]
+      df_sub <- df[keep_rows, !names(df) %in% c(".row_id", ".included"), drop = FALSE]
       is_dup <- duplicated(df_sub) | duplicated(df_sub, fromLast = TRUE)
       keep_rows <- keep_rows[is_dup]
       
@@ -495,9 +513,19 @@ server <- function(input, output, session) {
   # Fișier CSV temporar al datelor procesate → transmis funcțiilor Python
   temp_fp <- reactive({
     req(data_processed())
+    df <- data_processed()
+    if (".included" %in% names(df)) df <- df[df$.included == TRUE, , drop = FALSE]
+    df <- df[, !names(df) %in% c(".included", ".row_id"), drop = FALSE]
     tmp <- tempfile(fileext = ".csv")
-    write.csv(data_processed(), tmp, row.names = FALSE)
+    write.csv(df, tmp, row.names = FALSE)
     tmp
+  })
+  
+  data_for_analysis <- reactive({
+    req(data_final())
+    df <- data_final()
+    if (".included" %in% names(df)) df <- df[df$.included == TRUE, , drop = FALSE]
+    df[, !names(df) %in% c(".included", ".row_id"), drop = FALSE]
   })
   
   # -------------------------------------------------------------------------
@@ -539,6 +567,17 @@ server <- function(input, output, session) {
   })
   observeEvent(input$reset_filter, {
     updateSelectInput(session, "filter_col", selected = "")
+  })
+  
+  observeEvent(input$toggle_row, {
+    info <- input$toggle_row
+    df   <- data_working()
+    idx  <- which(df$.row_id == as.integer(info$rowid))
+    if (length(idx) == 1) {
+      df$.included[idx] <- isTRUE(info$val)
+      data_working(df)
+      DT::replaceData(dt_proxy, data_final(), resetPaging = FALSE, rownames = FALSE)
+    }
   })
   
   # -------------------------------------------------------------------------
@@ -635,7 +674,9 @@ server <- function(input, output, session) {
   
   output$ui_dup_info <- renderUI({
     req(data_working())
-    n_dups <- sum(duplicated(data_working()))
+    df_chk <- data_working()
+    df_chk <- df_chk[, !names(df_chk) %in% c(".row_id", ".included"), drop = FALSE]
+    n_dups <- sum(duplicated(df_chk))
     if (n_dups == 0) {
       div(class = "alert-box alert-green", style = "padding:5px 10px; margin:4px 0;",
           icon("check"), tags$small(" Niciun duplicat detectat."))
@@ -651,11 +692,12 @@ server <- function(input, output, session) {
   # -------------------------------------------------------------------------
   
   output$ui_filter_value <- renderUI({
-    req(input$filter_col, data_working())
-    if (is.null(input$filter_col) || 
-        input$filter_col %in% c("", "__missing__", "__duplicates__")) return(NULL)
+    req(input$filter_col, input$file)
+    data_info()  # se reface la fișier nou sau override tip, dar NU la editare celulă
+    if (input$filter_col %in% c("", "__missing__", "__duplicates__")) return(NULL)
     
-    df  <- data_working()
+    df  <- isolate(data_working())
+    if (is.null(df)) return(NULL)
     col <- input$filter_col
     if (!col %in% names(df)) return(NULL)
     
@@ -752,11 +794,43 @@ server <- function(input, output, session) {
   
   output$tbl_data_preview <- renderDT({
     req(data_final())
+    df      <- data_final()
+    inc_col <- which(names(df) == ".included") - 1
+    rid_col <- which(names(df) == ".row_id")   - 1
+    
+    js_render <- JS(paste0(
+      "function(data, type, row, meta) {",
+      "  if (type !== 'display') return data;",
+      "  var chk = (data === true || data === 'TRUE' || data === 1) ? ' checked' : '';",
+      "  var rid = row[", rid_col, "];",
+      "  return '<input type=\"checkbox\"' + chk + ' onchange=\"toggleRow(this,' + rid + ')\">';",
+      "}"
+    ))
+    
+    js_row_cb <- JS(paste0(
+      "function(row, data, index) {",
+      "  var iv = data[", inc_col, "];",
+      "  if (iv === false || iv === 'false' || iv === 'FALSE' || iv === 0) {",
+      "    $(row).css({opacity: '0.45', 'background-color': '#fff8e1'});",
+      "  }",
+      "}"
+    ))
+    
     datatable(
-      data_final(),
-      editable = "cell",
-      rownames = FALSE,
-      options  = list(pageLength = 10, scrollX = TRUE, dom = "lfrtip")
+      df,
+      editable  = list(target = "cell", disable = list(columns = c(inc_col, rid_col))),
+      rownames  = FALSE,
+      selection = "none",
+      options   = list(
+        pageLength  = 10,
+        scrollX     = TRUE,
+        dom         = "lfrtip",
+        columnDefs  = list(
+          list(targets = rid_col, visible = FALSE),
+          list(targets = inc_col, title = "Inclus", render = js_render)
+        ),
+        rowCallback = js_row_cb
+      )
     )
   })
   
@@ -767,8 +841,8 @@ server <- function(input, output, session) {
   output$dl_data_csv <- downloadHandler(
     filename = function() paste0("date_procesate_", Sys.Date(), ".csv"),
     content  = function(file) {
-      req(data_final())
-      write.csv(data_final(), file, row.names = FALSE)
+      req(data_for_analysis())
+      write.csv(data_for_analysis(), file, row.names = FALSE)
     }
   )
   
@@ -819,7 +893,10 @@ server <- function(input, output, session) {
     else 0.0
     
     grp_props <- tryCatch({
-      tbl <- table(data_processed()[[input$sensitive]])
+      df_tmp <- data_processed()
+      if (".included" %in% names(df_tmp))
+        df_tmp <- df_tmp[df_tmp$.included == TRUE, , drop = FALSE]
+      tbl <- table(df_tmp[[input$sensitive]])
       as.numeric(tbl / sum(tbl))
     }, error = function(e) c(0.5, 0.5))
     
@@ -1225,8 +1302,8 @@ server <- function(input, output, session) {
   # -------------------------------------------------------------------------
   
   make_boxplot_gg <- function() {
-    req(data_final(), input$sensitive, input$target)
-    df <- data_final()
+    req(data_for_analysis(), input$sensitive, input$target)
+    df <- data_for_analysis()
     df[[input$target]] <- suppressWarnings(as.numeric(df[[input$target]]))
     ggplot(df, aes(x = .data[[input$sensitive]], y = .data[[input$target]],
                    fill = .data[[input$sensitive]])) +
@@ -1236,8 +1313,8 @@ server <- function(input, output, session) {
   }
   
   make_density_gg <- function() {
-    req(data_final(), input$sensitive, input$target)
-    df <- data_final()
+    req(data_for_analysis(), input$sensitive, input$target)
+    df <- data_for_analysis()
     df[[input$target]] <- suppressWarnings(as.numeric(df[[input$target]]))
     ggplot(df, aes(x = .data[[input$target]],
                    fill  = as.factor(.data[[input$sensitive]]),
@@ -1248,8 +1325,8 @@ server <- function(input, output, session) {
   }
   
   make_barplot_gg <- function() {
-    req(data_final(), input$sensitive, input$target)
-    df <- data_final()
+    req(data_for_analysis(), input$sensitive, input$target)
+    df <- data_for_analysis()
     df[[input$target]] <- suppressWarnings(as.numeric(df[[input$target]]))
     grand_mean <- mean(df[[input$target]], na.rm = TRUE)
     df_bar <- df %>%
