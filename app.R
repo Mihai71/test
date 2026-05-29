@@ -1,4 +1,5 @@
 # app.R - Dashboard Interactiv pentru Detectarea Disparităților
+options(shiny.maxRequestSize = 50 * 1024^2)
 # Arhitectură: R Shiny (UI + server reactiv) + Python via reticulate (procesare date)
 # Cerințe implementate: FR-01 .. FR-07
 # reticulate::use_python("C:/Users/pelle/AppData/Local/Programs/Python/Python312/python.exe", required = TRUE)
@@ -10,6 +11,7 @@ library(dplyr)
 library(tidyr)
 library(stringr)
 library(reticulate)
+library(jsonlite)
 
 # Plotly pentru grafice interactive – FR-07
 if (requireNamespace("plotly", quietly = TRUE)) library(plotly)
@@ -19,6 +21,7 @@ if (requireNamespace("readxl", quietly = TRUE)) library(readxl)
 
 source("R/standards.R")
 source_python("logic.py")
+source_python("clustering.py")
 
 # ---------------------------------------------------------------------------
 # Helpere R
@@ -65,6 +68,7 @@ ui <- dashboardPage(
       menuItem("Analiză Generală", tabName = "tab_bias",   icon = icon("balance-scale")),
       menuItem("Socio-Demografic", tabName = "tab_socio",  icon = icon("users")),
       menuItem("Vizualizare",      tabName = "tab_viz",    icon = icon("chart-bar")),
+      menuItem("Clustere AI", tabName = "tab_clustering", icon = icon("project-diagram")),
       menuItem("Export",           tabName = "tab_export", icon = icon("download"))
     ),
     tags$hr(),
@@ -131,7 +135,7 @@ ui <- dashboardPage(
       # TAB DATE
       # -----------------------------------------------------------------------
       tabItem(tabName = "tab_data",
-              
+              # --- Grafice interpretabile K-Means (Vârsta/Edu/Mediu vs Venit) ---
               fluidRow(
                 box(title = "Sumar fișier", status = "primary", solidHeader = TRUE, width = 12,
                     uiOutput("ui_file_summary")
@@ -324,7 +328,151 @@ ui <- dashboardPage(
                 )
               )
       ),
-      
+      # -----------------------------------------------------------------------
+      # TAB CLUSTERE ML
+      # -----------------------------------------------------------------------
+      tabItem(tabName = "tab_clustering",
+              
+              fluidRow(
+                box(title = tagList(icon("sliders-h"), " Pasul 1: Mapare Coloane"),
+                    status = "primary", solidHeader = TRUE, width = 12,
+                    p(style = "color:#666; font-size:13px;",
+                      "Selectează coloanele din setul de date încărcat care corespund fiecărui rol semantic. 
+                 Sistemul detectează automat scalele (numerice sau text/țări)."),
+                    fluidRow(
+                      column(2,
+                             selectInput("cl_col_sex",    "Sex *",              choices = NULL),
+                             tags$small(class="text-muted", "Ex: gndr, sex, gender")
+                      ),
+                      column(2,
+                             selectInput("cl_col_age",    "Vârstă *",           choices = NULL),
+                             tags$small(class="text-muted", "Ex: agea, varsta, age")
+                      ),
+                      column(2,
+                             selectInput("cl_col_edu",    "Educație *",         choices = NULL),
+                             tags$small(class="text-muted", "Ex: eisced, edu, nivel_edu")
+                      ),
+                      column(2,
+                             selectInput("cl_col_env",    "Mediu / Origine *",  choices = NULL),
+                             tags$small(class="text-muted", "Ex: domicil, cntry, tara, oras")
+                      ),
+                      column(2,
+                             selectInput("cl_col_income", "Indicator Financiar *", choices = NULL),
+                             tags$small(class="text-muted", "Ex: hinctnta, salariu, venit")
+                      ),
+                      column(2,
+                             selectInput("cl_col_extra",  "Coloane Adiționale",
+                                         choices = NULL, multiple = TRUE),
+                             tags$small(class="text-muted", "Opțional: health, happy, pdwrk etc.")
+                      )
+                    )
+                )
+              ),
+              fluidRow(
+                box(
+                  title = tagList(icon("birthday-cake"), " Vârstă vs Venit — K-Means"),
+                  status = "info", solidHeader = TRUE, width = 6,
+                  p(style = "color:#666; font-size:12px;",
+                    "Fiecare punct = o persoană, colorat după clusterul K-Means. Venit filtrat p2–p98."),
+                  plotly::plotlyOutput("plot_cl_age_income", height = "320px")
+                ),
+                box(
+                  title = tagList(icon("graduation-cap"), " Educație vs Venit — K-Means"),
+                  status = "info", solidHeader = TRUE, width = 6,
+                  p(style = "color:#666; font-size:12px;",
+                    "Scatter pentru educație numerică; box plot pentru text (Liceu / Master etc.)."),
+                  plotly::plotlyOutput("plot_cl_edu_income", height = "320px")
+                )
+              ),
+              fluidRow(
+                box(
+                  title = tagList(icon("map-marker-alt"), " Mediu/Origine vs Venit — K-Means"),
+                  status = "info", solidHeader = TRUE, width = 12,
+                  p(style = "color:#666; font-size:12px;",
+                    "Box plot al venitului pe categorie de mediu/țară, colorat după cluster."),
+                  plotly::plotlyOutput("plot_cl_env_income", height = "320px")
+                )
+              ),
+              fluidRow(
+                box(title = tagList(icon("cogs"), " Pasul 2: Parametri Clustering"),
+                    status = "warning", solidHeader = TRUE, width = 12,
+                    fluidRow(
+                      column(4,
+                             sliderInput("cl_n_clusters", "Număr de clustere",
+                                         min = 2, max = 8, value = 4, step = 1),
+                             tags$small(class = "text-muted",
+                                        "Nesigur? Folosește 'Sugestie k' de mai jos.")
+                      ),
+                      column(4,
+                             div(style = "margin-top: 25px;",
+                                 actionButton("run_clustering",
+                                              tagList(icon("play"), " Rulează Clustering"),
+                                              class = "btn-success btn-lg")
+                             )
+                      ),
+                      column(4,
+                             uiOutput("ui_clustering_status")
+                      )
+                    ),
+                    tags$hr(),
+                    fluidRow(
+                      column(4,
+                             tags$b(icon("lightbulb"), " Sugestie număr de clustere:"),
+                             tags$br(), tags$br(),
+                             actionButton("run_elbow",
+                                          tagList(icon("search"), " Calculează sugestie k"),
+                                          class = "btn-info btn-sm"),
+                             tags$br(),
+                             tags$small(class = "text-muted",
+                                        "Rulează rapid pe un eșantion din date (câteva secunde).")
+                      ),
+                      column(8,
+                             uiOutput("ui_elbow_suggestion"),
+                             conditionalPanel(
+                               condition = "output.elbow_done == true",
+                               plotly::plotlyOutput("plot_elbow", height = "180px")
+                             )
+                      )
+                    )
+                )
+              ),
+              
+              conditionalPanel(
+                condition = "output.clustering_done == true",
+                
+                fluidRow(
+                  box(title = tagList(icon("chart-scatter"), " Vizualizare Clustere (PCA 2D)"),
+                      status = "info", solidHeader = TRUE, width = 8,
+                      plotly::plotlyOutput("plot_cluster_scatter", height = "420px")
+                  ),
+                  box(title = tagList(icon("table"), " Rezumat Clustere"),
+                      status = "primary", solidHeader = TRUE, width = 4,
+                      DTOutput("tbl_cluster_summary")
+                  )
+                ),
+                
+                fluidRow(
+                  box(title = tagList(icon("users"), " Profile Detaliate per Cluster"),
+                      status = "success", solidHeader = TRUE, width = 12,
+                      uiOutput("ui_cluster_profiles")
+                  )
+                ),
+                
+                fluidRow(
+                  box(title = tagList(icon("balance-scale"), " Analiză Bias per Cluster"),
+                      status = "danger", solidHeader = TRUE, width = 12,
+                      uiOutput("ui_cluster_bias")
+                  )
+                ),
+                
+                fluidRow(
+                  box(title = tagList(icon("chart-bar"), " Distribuție Financiară per Cluster"),
+                      status = "warning", solidHeader = TRUE, width = 12,
+                      plotly::plotlyOutput("plot_cluster_income", height = "350px")
+                  )
+                )
+              )
+      ),
       # -----------------------------------------------------------------------
       # TAB EXPORT
       # -----------------------------------------------------------------------
@@ -359,7 +507,10 @@ ui <- dashboardPage(
 # ---------------------------------------------------------------------------
 
 server <- function(input, output, session) {
-  
+  # Paletă comună clustere — aceeași culoare peste tot
+  CL_PALETTE <- c("#3498db","#e74c3c","#2ecc71","#f39c12",
+                  "#9b59b6","#1abc9c","#e67e22","#34495e")
+  cl_color <- function(cid) CL_PALETTE[(as.integer(cid) %% length(CL_PALETTE)) + 1]
   manual_types <- reactiveVal(list())
   
   # -------------------------------------------------------------------------
@@ -390,10 +541,10 @@ server <- function(input, output, session) {
         readxl::read_excel(fp)
       } else {
         showNotification("Instalați pachetul readxl pentru suport Excel.", type = "warning")
-        read.csv(fp)
+        read.csv(fp, check.names = FALSE)
       }
     } else {
-      read.csv(fp)
+      read.csv(fp, check.names = FALSE)
     }
   })
   
@@ -1392,7 +1543,549 @@ server <- function(input, output, session) {
         icon("info-circle"),
         " Rulați analiza mai întâi (butonul din sidebar), apoi descărcați raportul.")
   })
+  # =========================================================================
+  # SERVER: TAB CLUSTERE ML
+  # =========================================================================
   
+  # Populare dropdowns când se încarcă fișierul
+  observeEvent(input$file, {
+    req(data_info())
+    cols <- data_info()$columns
+    
+    updateSelectInput(session, "cl_col_sex",    choices = cols)
+    updateSelectInput(session, "cl_col_age",    choices = cols)
+    updateSelectInput(session, "cl_col_edu",    choices = cols)
+    updateSelectInput(session, "cl_col_env",    choices = cols)
+    updateSelectInput(session, "cl_col_income", choices = cols)
+    updateSelectInput(session, "cl_col_extra",  choices = cols)
+    
+    # Auto-selecție inteligentă pe baza numelor coloanelor
+    cols_lower <- tolower(cols)
+    
+    find_col <- function(patterns) {
+      for (p in patterns) {
+        idx <- grep(p, cols_lower)
+        if (length(idx) > 0) return(cols[idx[1]])
+      }
+      return(cols[1])
+    }
+    
+    updateSelectInput(session, "cl_col_sex",
+                      selected = find_col(c("gndr","sex","gender")))
+    updateSelectInput(session, "cl_col_age",
+                      selected = find_col(c("agea","age","varst","yrbrn")))
+    updateSelectInput(session, "cl_col_edu",
+                      selected = find_col(c("eisced","edu","nivel","isced")))
+    updateSelectInput(session, "cl_col_env",
+                      selected = find_col(c("domicil","cntry","tara","country","region","mediu")))
+    updateSelectInput(session, "cl_col_income",
+                      selected = find_col(c("hinctnta","income","venit","salariu","wage","salary")))
+  })
+  
+  # Stochează rezultatele clustering
+  clustering_result <- reactiveVal(NULL)
+  
+  # Flag pentru conditionalPanel
+  output$clustering_done <- reactive({
+    !is.null(clustering_result()) && is.null(clustering_result()$error)
+  })
+  outputOptions(output, "clustering_done", suspendWhenHidden = FALSE)
+  
+  # Buton Rulează Clustering
+  observeEvent(input$run_clustering, {
+    req(input$file, input$cl_col_sex, input$cl_col_age,
+        input$cl_col_edu, input$cl_col_env, input$cl_col_income)
+    
+    clustering_result(NULL)
+    
+    showNotification(
+      tagList(icon("spinner"), " Clustering în desfășurare..."),
+      id = "cl_notif", type = "message", duration = NULL
+    )
+    
+    extra_json <- if (length(input$cl_col_extra) > 0)
+      jsonlite::toJSON(input$cl_col_extra, auto_unbox = FALSE)
+    else "[]"
+    
+    result <- tryCatch({
+      run_clustering(
+        file_path     = temp_fp(),
+        col_sex       = input$cl_col_sex,
+        col_age       = input$cl_col_age,
+        col_edu       = input$cl_col_edu,
+        col_env       = input$cl_col_env,
+        col_income    = input$cl_col_income,
+        col_extra_json = extra_json,
+        n_clusters    = input$cl_n_clusters
+      )
+    }, error = function(e) {
+      list(error = paste("Eroare R:", e$message))
+    })
+    
+    result <- py_to_r_safe(result)
+    removeNotification("cl_notif")
+    
+    if (!is.null(result$error)) {
+      showNotification(result$error, type = "error", duration = 10)
+    } else {
+      clustering_result(result)
+      showNotification(
+        tagList(icon("check-circle"), " Clustering finalizat!"),
+        type = "message", duration = 4
+      )
+    }
+  })
+  
+  # Status clustering
+  output$ui_clustering_status <- renderUI({
+    res <- clustering_result()
+    if (is.null(res)) return(NULL)
+    if (!is.null(res$error)) return(NULL)
+    div(class = "alert-box alert-green", style = "margin-top:20px;",
+        icon("check-circle"),
+        tags$b(paste0(" ", res$n_rows_used, " rânduri clustered")),
+        tags$br(),
+        tags$small(paste0("(din ", res$n_rows_total, " totale, ",
+                          res$n_rows_total - res$n_rows_used,
+                          " excluse pt. valori lipsă)"))
+    )
+  })
+  
+  # --- Scatter PCA 2D ---
+  output$plot_cluster_scatter <- plotly::renderPlotly({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    
+    pca  <- as.data.frame(res$pca_data, check.names = FALSE)
+    n_cl <- as.integer(res$n_clusters)
+    
+    # Culori cu nume — cluster "0" → prima culoare, etc.
+    named_colors <- setNames(CL_PALETTE[1:n_cl], as.character(0:(n_cl - 1)))
+    pca$cluster  <- as.character(pca[["_cluster"]])
+    
+    # Etichete axe cu contribuția reală a variabilelor
+    pc_lbl <- if (!is.null(res$pc_labels) && length(res$pc_labels) >= 2)
+      lapply(res$pc_labels, as.character)
+    else
+      list("Componenta principală 1", "Componenta principală 2")
+    
+    var_map <- list(
+      "Venit"         = input$cl_col_income,
+      "Vârstă"        = input$cl_col_age,
+      "Sex"           = input$cl_col_sex,
+      "Educație"      = input$cl_col_edu,
+      "Mediu/Origine" = input$cl_col_env
+    )
+    
+    # Extrage variabilele dominante din PC labels, deduplicate, în ordine
+    pc_var_names <- character(0)
+    if (!is.null(res$pc_labels) && length(res$pc_labels) >= 2) {
+      for (lbl in res$pc_labels) {
+        parts <- strsplit(as.character(lbl), ": ")[[1]]
+        if (length(parts) >= 2) {
+          vars         <- trimws(strsplit(parts[2], " \\+ ")[[1]])
+          pc_var_names <- unique(c(pc_var_names, vars))
+        }
+      }
+    }
+    pc_var_names <- pc_var_names[pc_var_names %in% names(var_map)]
+    if (!"Venit" %in% pc_var_names) pc_var_names <- c("Venit", pc_var_names)
+    
+    # Construiește tooltip dinamic
+    tooltip_text <- paste0("Cluster: ", pca$cluster)
+    for (vn in pc_var_names) {
+      col_n    <- var_map[[vn]]
+      if (col_n %in% names(pca)) {
+        raw_v  <- pca[[col_n]]
+        num_v  <- suppressWarnings(as.numeric(as.character(raw_v)))
+        fmt_v  <- ifelse(!is.na(num_v), as.character(round(num_v, 1)), as.character(raw_v))
+        tooltip_text <- paste0(tooltip_text, "<br>", vn, ": ", fmt_v)
+      }
+    }
+    
+    plotly::plot_ly(
+      data      = pca,
+      x         = ~`_pca_x`,
+      y         = ~`_pca_y`,
+      color     = ~cluster,
+      colors    = named_colors,
+      text      = tooltip_text,
+      hoverinfo = "text",
+      type      = "scatter",
+      mode      = "markers",
+      marker    = list(size = 5, opacity = 0.7)
+    ) %>%
+      plotly::layout(
+        title  = "Distribuția clusterelor (PCA 2D)",
+        xaxis  = list(title = pc_lbl[[1]]),
+        yaxis  = list(title = pc_lbl[[2]]),
+        legend = list(title = list(text = "Cluster"))
+      )
+  })
+  
+  # --- Tabel rezumat clustere ---
+  output$tbl_cluster_summary <- renderDT({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    
+    profiles <- res$profiles
+    tbl <- do.call(rbind, lapply(profiles, function(p) {
+      p <- py_to_r_safe(p)
+      data.frame(
+        Cluster = paste0("C", p$cluster_id),
+        Label   = if (!is.null(p$label)) as.character(p$label) else "–",
+        `N`      = p$n,
+        `%`      = paste0(p$pct, "%"),
+        `Venit mediu` = if (!is.null(p$income_mean)) round(as.numeric(p$income_mean), 2) else "–",
+        `Vârstă medie` = if (!is.null(p$age_mean)) round(as.numeric(p$age_mean), 1) else "–",
+        `% Femei` = if (!is.null(p$female_pct)) paste0(p$female_pct, "%") else "–",
+        check.names = FALSE
+      )
+    }))
+    
+    datatable(tbl, options = list(dom = 't', pageLength = 10),
+              rownames = FALSE, class = "compact stripe")
+  })
+  
+  # --- Profile detaliate ---
+  output$ui_cluster_profiles <- renderUI({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    
+    profile_cards <- lapply(res$profiles, function(p) {
+      p <- py_to_r_safe(p)
+      cid   <- as.integer(p$cluster_id)
+      color <- cl_color(cid)
+      
+      env_text <- if (!is.null(p$env_top)) {
+        top <- p$env_top
+        paste(names(top), unlist(top), sep = ": ", collapse = " | ")
+      } else if (!is.null(p$env_mean)) {
+        paste0("Medie: ", round(as.numeric(p$env_mean), 2))
+      } else "–"
+      
+      column(3,
+             div(style = paste0("border-left: 5px solid ", color,
+                                "; padding: 12px; background: #fafafa;",
+                                " border-radius: 6px; margin-bottom: 10px;"),
+                 tags$h4(style = paste0("color:", color, "; margin-top:0;"),
+                         paste0("Cluster ", cid)),
+                 tags$p(style = "color:#888; font-size:12px; margin:-8px 0 6px 0; font-style:italic;",
+                        if (!is.null(p$label)) as.character(p$label) else ""),
+                 tags$p(tags$b(icon("users"), paste0(" ", p$n, " persoane (", p$pct, "%)"))),
+                 tags$hr(style = "margin: 6px 0;"),
+                 tags$p(icon("euro-sign"),
+                        tags$b(" Venit mediu: "),
+                        if (!is.null(p$income_mean))
+                          paste0(round(as.numeric(p$income_mean), 2),
+                                 " (median: ", round(as.numeric(p$income_median), 2), ")")
+                        else "–"),
+                 tags$p(icon("birthday-cake"),
+                        tags$b(" Vârstă medie: "),
+                        if (!is.null(p$age_mean)) paste0(p$age_mean, " ani") else "–"),
+                 tags$p(icon("venus-mars"),
+                        tags$b(" Distribuție sex: "),
+                        if (!is.null(p$female_pct))
+                          paste0(p$female_pct, "% F / ", p$male_pct, "% M")
+                        else "–"),
+                 tags$p(icon("graduation-cap"),
+                        tags$b(" Educație: "),
+                        if (isTRUE(p$edu_is_text) && !is.null(p$edu_mode_text))
+                          p$edu_mode_text
+                        else if (!is.null(p$edu_mean))
+                          round(as.numeric(p$edu_mean), 2)
+                        else "–"),
+                 tags$p(icon("map-marker-alt"),
+                        tags$b(" Mediu/Origine: "), env_text)
+             )
+      )
+    })
+    
+    do.call(fluidRow, profile_cards)
+  })
+  
+  # --- Bias per cluster ---
+  output$ui_cluster_bias <- renderUI({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    
+    bias_blocks <- lapply(res$bias_per_cluster, function(cb) {
+      cb    <- py_to_r_safe(cb)
+      cid   <- as.integer(cb$cluster_id)
+      score <- if (!is.null(cb$bias_score)) as.numeric(cb$bias_score) else 0
+      sev   <- if (!is.null(cb$severity)) cb$severity else "–"
+      color <- if (score < 0.20) "#27ae60" else if (score < 0.50) "#f39c12" else "#e74c3c"
+      
+      analyses_ui <- lapply(cb$analyses, function(a) {
+        a <- py_to_r_safe(a)
+        cd_label <- if (!is.null(a$cohen_d_label)) a$cohen_d_label else "–"
+        cd_val   <- if (!is.null(a$cohen_d)) round(as.numeric(a$cohen_d), 3) else "–"
+        
+        div(style = "margin: 4px 0; padding: 4px 8px; background:#f5f5f5; border-radius:4px;",
+            tags$span(tags$b(a$attribute), ": "),
+            tags$span(paste0("Cohen's d = ", cd_val, " (", cd_label, ")")),
+            if (!is.null(a$pct_diff))
+              tags$span(style = "color:#888; font-size:12px;",
+                        paste0(" | Diferență: ", a$pct_diff, "%"))
+        )
+      })
+      
+      column(3,
+             div(style = paste0("border: 2px solid ", color,
+                                "; padding: 12px; border-radius: 6px; margin-bottom: 10px;"),
+                 tags$h5(style = "margin-top:0;",
+                         tags$span(style = paste0("display:inline-block; width:12px; height:12px;",
+                                                  " border-radius:50%; background:", cl_color(cid),
+                                                  "; margin-right:6px;")),
+                         tags$span(style = paste0("color:", color),
+                                   paste0("Cluster ", cid, " — ", sev))
+                 ),
+                 tags$p(style = paste0("font-size:1.8em; font-weight:bold; color:", color,
+                                       "; text-align:center; margin:4px 0;"),
+                        score),
+                 do.call(tagList, analyses_ui)
+             )
+      )
+    })
+    
+    do.call(fluidRow, bias_blocks)
+  })
+  
+  output$plot_cluster_income <- plotly::renderPlotly({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    
+    pca_data   <- as.data.frame(res$pca_data, check.names = FALSE)
+    income_col <- input$cl_col_income
+    if (!income_col %in% names(pca_data)) return(plotly::plotly_empty())
+    
+    n_cl         <- as.integer(res$n_clusters)
+    named_colors <- setNames(CL_PALETTE[1:n_cl], paste0("C", 0:(n_cl - 1)))
+    pca_data$cluster <- paste0("C", pca_data[["_cluster"]])
+    
+    plotly::plot_ly(
+      data   = pca_data,
+      x      = ~cluster,
+      y      = as.formula(paste0("~`", income_col, "`")),
+      color  = ~cluster,
+      colors = named_colors,
+      type   = "box"
+    ) %>%
+      plotly::layout(
+        title      = paste0("Distribuția '", income_col, "' per Cluster"),
+        xaxis      = list(title = "Cluster"),
+        yaxis      = list(title = income_col),
+        showlegend = FALSE
+      )
+  })
+  # --- Vârstă vs Venit ---
+  output$plot_cl_age_income <- plotly::renderPlotly({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    df_plot    <- as.data.frame(res$pca_data, check.names = FALSE)
+    age_col    <- input$cl_col_age
+    income_col <- input$cl_col_income
+    if (!age_col %in% names(df_plot) || !income_col %in% names(df_plot))
+      return(plotly::plotly_empty())
+    df_plot$cluster <- paste0("C", df_plot[["_cluster"]])
+    df_plot$age_v   <- suppressWarnings(as.numeric(as.character(df_plot[[age_col]])))
+    df_plot$inc_v   <- suppressWarnings(as.numeric(as.character(df_plot[[income_col]])))
+    inc_q   <- quantile(df_plot$inc_v, c(0.02, 0.98), na.rm = TRUE)
+    df_plot <- df_plot[!is.na(df_plot$inc_v) & !is.na(df_plot$age_v) &
+                         df_plot$inc_v >= inc_q[1] & df_plot$inc_v <= inc_q[2], ]
+    if (nrow(df_plot) == 0) return(plotly::plotly_empty())
+    n_cl         <- as.integer(res$n_clusters)
+    named_colors <- setNames(CL_PALETTE[1:n_cl], paste0("C", 0:(n_cl - 1)))
+    plotly::plot_ly(
+      data = df_plot, x = ~age_v, y = ~inc_v,
+      color = ~cluster, colors = named_colors,
+      type = "scatter", mode = "markers",
+      marker = list(size = 4, opacity = 0.55),
+      hoverinfo = "text",
+      text = ~paste0("Cluster: ", cluster,
+                     "<br>Vârstă: ", round(age_v, 0),
+                     "<br>Venit: ",  round(inc_v, 2))
+    ) %>% plotly::layout(
+      xaxis  = list(title = paste("Vârstă —", age_col)),
+      yaxis  = list(title = paste("Venit —", income_col)),
+      legend = list(title = list(text = "Cluster"))
+    )
+  })
+  
+  # --- Educație vs Venit ---
+  output$plot_cl_edu_income <- plotly::renderPlotly({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    df_plot    <- as.data.frame(res$pca_data, check.names = FALSE)
+    edu_col    <- input$cl_col_edu
+    income_col <- input$cl_col_income
+    if (!edu_col %in% names(df_plot) || !income_col %in% names(df_plot))
+      return(plotly::plotly_empty())
+    df_plot$cluster <- paste0("C", df_plot[["_cluster"]])
+    df_plot$edu_v   <- df_plot[[edu_col]]
+    df_plot$inc_v   <- suppressWarnings(as.numeric(as.character(df_plot[[income_col]])))
+    inc_q   <- quantile(df_plot$inc_v, c(0.02, 0.98), na.rm = TRUE)
+    df_plot <- df_plot[!is.na(df_plot$inc_v) & !is.na(df_plot$edu_v) &
+                         df_plot$inc_v >= inc_q[1] & df_plot$inc_v <= inc_q[2], ]
+    if (nrow(df_plot) == 0) return(plotly::plotly_empty())
+    n_cl         <- as.integer(res$n_clusters)
+    named_colors <- setNames(CL_PALETTE[1:n_cl], paste0("C", 0:(n_cl - 1)))
+    if (nrow(df_plot) == 0) return(plotly::plotly_empty())
+    edu_num_test <- suppressWarnings(as.numeric(as.character(df_plot$edu_v)))
+    is_num_edu   <- isTRUE(mean(!is.na(edu_num_test)) > 0.7)
+    if (is_num_edu) {
+      df_plot$edu_num <- edu_num_test
+      plotly::plot_ly(
+        data = df_plot, x = ~edu_num, y = ~inc_v,
+        color = ~cluster, colors = named_colors,
+        type = "scatter", mode = "markers",
+        marker = list(size = 4, opacity = 0.55),
+        hoverinfo = "text",
+        text = ~paste0("Cluster: ", cluster, "<br>Edu: ", edu_num, "<br>Venit: ", round(inc_v, 2))
+      ) %>% plotly::layout(
+        xaxis  = list(title = paste("Educație —", edu_col)),
+        yaxis  = list(title = paste("Venit —", income_col)),
+        legend = list(title = list(text = "Cluster"))
+      )
+    } else {
+      df_plot$edu_str <- as.character(df_plot$edu_v)
+      plotly::plot_ly(
+        data = df_plot, x = ~edu_str, y = ~inc_v,
+        color = ~cluster, colors = named_colors, type = "box"
+      ) %>% plotly::layout(
+        xaxis   = list(title = paste("Educație —", edu_col)),
+        yaxis   = list(title = paste("Venit —", income_col)),
+        boxmode = "group",
+        legend  = list(title = list(text = "Cluster"))
+      )
+    }
+  })
+  
+  # --- Mediu/Origine vs Venit ---
+  output$plot_cl_env_income <- plotly::renderPlotly({
+    req(clustering_result())
+    res <- clustering_result()
+    req(is.null(res$error))
+    df_plot    <- as.data.frame(res$pca_data, check.names = FALSE)
+    env_col    <- input$cl_col_env
+    income_col <- input$cl_col_income
+    if (!env_col %in% names(df_plot) || !income_col %in% names(df_plot))
+      return(plotly::plotly_empty())
+    df_plot$cluster <- paste0("C", df_plot[["_cluster"]])
+    df_plot$env_v   <- as.character(df_plot[[env_col]])
+    df_plot$inc_v   <- suppressWarnings(as.numeric(as.character(df_plot[[income_col]])))
+    inc_q   <- quantile(df_plot$inc_v, c(0.02, 0.98), na.rm = TRUE)
+    df_plot <- df_plot[!is.na(df_plot$inc_v) & df_plot$env_v != "NA" &
+                         df_plot$inc_v >= inc_q[1] & df_plot$inc_v <= inc_q[2], ]
+    if (nrow(df_plot) == 0) return(plotly::plotly_empty())
+    top_env <- names(sort(table(df_plot$env_v), decreasing = TRUE))[
+      1:min(15, length(unique(df_plot$env_v)))]
+    df_plot <- df_plot[df_plot$env_v %in% top_env, ]
+    n_cl         <- as.integer(res$n_clusters)
+    named_colors <- setNames(CL_PALETTE[1:n_cl], paste0("C", 0:(n_cl - 1)))
+    plotly::plot_ly(
+      data = df_plot, x = ~env_v, y = ~inc_v,
+      color = ~cluster, colors = named_colors, type = "box"
+    ) %>% plotly::layout(
+      xaxis   = list(title = paste("Mediu/Origine —", env_col)),
+      yaxis   = list(title = paste("Venit —", income_col)),
+      boxmode = "group",
+      legend  = list(title = list(text = "Cluster"))
+    )
+  })
+  # --- Elbow Method ---
+  elbow_result <- reactiveVal(NULL)
+  
+  output$elbow_done <- reactive({
+    !is.null(elbow_result()) && is.null(elbow_result()$error)
+  })
+  outputOptions(output, "elbow_done", suspendWhenHidden = FALSE)
+  
+  observeEvent(input$run_elbow, {
+    req(input$file, input$cl_col_sex, input$cl_col_age,
+        input$cl_col_edu, input$cl_col_env, input$cl_col_income)
+    
+    elbow_result(NULL)
+    showNotification(tagList(icon("spinner"), " Calculează elbow..."),
+                     id = "elbow_notif", type = "message", duration = NULL)
+    
+    extra_json <- if (length(input$cl_col_extra) > 0)
+      jsonlite::toJSON(input$cl_col_extra, auto_unbox = FALSE) else "[]"
+    
+    result <- tryCatch({
+      compute_elbow(
+        file_path      = temp_fp(),
+        col_sex        = input$cl_col_sex,
+        col_age        = input$cl_col_age,
+        col_edu        = input$cl_col_edu,
+        col_env        = input$cl_col_env,
+        col_income     = input$cl_col_income,
+        col_extra_json = extra_json
+      )
+    }, error = function(e) list(error = e$message))
+    
+    result <- py_to_r_safe(result)
+    removeNotification("elbow_notif")
+    
+    if (!is.null(result$error)) {
+      showNotification(result$error, type = "error", duration = 8)
+    } else {
+      elbow_result(result)
+      updateSliderInput(session, "cl_n_clusters",
+                        value = as.integer(result$suggested_k))
+    }
+  })
+  
+  output$ui_elbow_suggestion <- renderUI({
+    req(elbow_result())
+    res <- elbow_result()
+    req(is.null(res$error))
+    div(class = "alert-box alert-green", style = "margin: 8px 0;",
+        icon("check-circle"),
+        tags$b(paste0(" k optim sugerat: ", res$suggested_k, " clustere")),
+        tags$br(),
+        tags$small("Slider-ul a fost actualizat automat. ",
+                   "Cauți cotul unde curba WCSS se aplatizează.")
+    )
+  })
+  
+  output$plot_elbow <- plotly::renderPlotly({
+    req(elbow_result())
+    res <- elbow_result()
+    req(is.null(res$error))
+    
+    elbow_df <- do.call(rbind, lapply(res$elbow_data, function(x)
+      data.frame(k = as.integer(x$k), inertia = as.numeric(x$inertia))
+    ))
+    
+    sug_k <- as.integer(res$suggested_k)
+    sug_row <- elbow_df[elbow_df$k == sug_k, ]
+    
+    plotly::plot_ly() %>%
+      plotly::add_trace(data = elbow_df, x = ~k, y = ~inertia,
+                        type = "scatter", mode = "lines+markers",
+                        name = "WCSS",
+                        line   = list(color = "#3498db", width = 2),
+                        marker = list(size = 7, color = "#3498db")) %>%
+      plotly::add_trace(data = sug_row, x = ~k, y = ~inertia,
+                        type = "scatter", mode = "markers",
+                        name = paste0("Sugestie k=", sug_k),
+                        marker = list(size = 14, color = "#e74c3c",
+                                      symbol = "star")) %>%
+      plotly::layout(
+        title  = list(text = "Elbow Method (eșantion 5000 rânduri)", font = list(size = 13)),
+        xaxis  = list(title = "k (nr. clustere)", tickvals = 2:8, dtick = 1),
+        yaxis  = list(title = "Inerție WCSS"),
+        legend = list(orientation = "h")
+      )
+  })
 }
 
 shinyApp(ui, server)
